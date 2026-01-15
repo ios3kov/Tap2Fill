@@ -3,6 +3,7 @@ import type { Env, ParsedEnv } from "../env";
 import { withParsedEnv } from "../env";
 import { progressApi } from "./v1/progress";
 import { stateApi } from "./v1/state";
+import { cdnApi } from "../cdn/assets";
 
 export const api = new Hono<{ Bindings: ParsedEnv }>();
 
@@ -18,3 +19,4 @@ api.get("/health", (c) => c.json({ ok: true }));
 
 api.route("/", progressApi);
 api.route("/", stateApi);
+api.route("/", cdnApi);

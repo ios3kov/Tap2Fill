@@ -16,6 +16,7 @@ export type Env = {
 
   // Bindings
   DB: D1Database;
+  ASSETS: R2Bucket;
 };
 
 function toInt(v: string, dflt: number, min: number, max: number): number {
