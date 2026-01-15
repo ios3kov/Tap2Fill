@@ -1,0 +1,16 @@
+# Node
+node_modules
+.pnpm-store
+*.log
+
+# Builds
+dist
+.vite
+*.tsbuildinfo
+
+# OS
+.DS_Store
+
+# Env
+.env
+.env.*

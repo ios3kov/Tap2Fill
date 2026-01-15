@@ -1,0 +1,22 @@
+name = "tap2fill-worker"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+
+[vars]
+ENV = "dev"
+WEBAPP_ORIGIN = "https://tap2fill-web.pages.dev"
+INITDATA_MAX_AGE_SEC = "3600"
+PAYLOAD_MAX_BYTES = "131072"
+RATE_LIMIT_ENABLED = "1"
+RATE_LIMIT_WINDOW_SEC = "60"
+RATE_LIMIT_MAX_REQUESTS = "120"
+
+# Bindings: заполните после создания в Cloudflare
+# [[d1_databases]]
+# binding = "DB"
+# database_name = "tap2fill-db"
+# database_id = "REPLACE_ME"
+#
+# [[r2_buckets]]
+# binding = "ASSETS"
+# bucket_name = "tap2fill-assets"

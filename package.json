@@ -1,0 +1,14 @@
+{
+  "name": "tap2fill",
+  "private": true,
+  "packageManager": "pnpm@9.15.4",
+  "scripts": {
+    "dev:web": "pnpm -C apps/web dev",
+    "build:web": "pnpm -C apps/web build",
+    "dev:worker": "pnpm -C apps/worker dev",
+    "deploy:worker": "pnpm -C apps/worker deploy",
+    "typecheck": "pnpm -r typecheck",
+    "lint": "pnpm -r lint",
+    "format": "pnpm -r format"
+  }
+}
