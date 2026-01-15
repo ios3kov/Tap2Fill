@@ -1,29 +1,30 @@
-export type TmaWebApp = {
-  ready: () => void;
-  expand: () => void;
-  initData?: string;
-};
-
-export function getWebApp(): TmaWebApp | null {
-  const w = window as unknown as { Telegram?: { WebApp?: TmaWebApp } };
-  return w.Telegram?.WebApp ?? null;
+declare global {
+  interface Window {
+    Telegram?: {
+      WebApp?: {
+        initData?: string;
+        ready?: () => void;
+        expand?: () => void;
+      };
+    };
+  }
 }
 
 export function isTma(): boolean {
-  return Boolean(getWebApp());
+  return Boolean(window.Telegram?.WebApp);
 }
 
 export function getInitData(): string {
-  return String(getWebApp()?.initData ?? "");
+  return window.Telegram?.WebApp?.initData ?? "";
 }
 
 export function tmaBootstrap(): void {
-  const wa = getWebApp();
+  const wa = window.Telegram?.WebApp;
   if (!wa) return;
   try {
-    wa.ready();
-    wa.expand();
+    wa.ready?.();
+    wa.expand?.();
   } catch {
-    // no-op
+    // no-op: defensive; TMA APIs differ across clients
   }
 }

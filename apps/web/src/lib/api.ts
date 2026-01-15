@@ -1,22 +1,29 @@
 import { getInitData } from "./tma";
 
-function apiBase(): string {
-  return "https://tap2fill-worker.os3kov.workers.dev";
-}
+const API_BASE = "https://tap2fill-worker.os3kov.workers.dev";
 
-export async function putMeState(lastPageId: string | null): Promise<unknown> {
-  const initData = getInitData();
+type Json = Record<string, unknown>;
 
-  const res = await fetch(`${apiBase()}/v1/me/state`, {
-    method: "PUT",
+async function httpJson<T extends Json>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(`${API_BASE}${path}`, {
+    ...init,
     headers: {
       "content-type": "application/json",
-      "x-tg-init-data": initData,
+      "x-tg-init-data": getInitData(),
+      ...(init?.headers ?? {}),
     },
-    body: JSON.stringify({ lastPageId }),
   });
 
-  const json = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(`${res.status} ${JSON.stringify(json)}`);
-  return json;
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(`${res.status} ${text}`);
+  }
+  return JSON.parse(text) as T;
+}
+
+export function putMeState(lastPageId: string | null) {
+  return httpJson<{ ok: true; state: unknown }>("/v1/me/state", {
+    method: "PUT",
+    body: JSON.stringify({ lastPageId }),
+  });
 }
