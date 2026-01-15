@@ -12,6 +12,7 @@
     "format": "biome format --write ."
   },
   "dependencies": {
+    "idb-keyval": "^6.2.2",
     "react": "^19.2.0",
     "react-dom": "^19.2.0"
   },
