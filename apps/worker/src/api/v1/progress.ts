@@ -1,3 +1,4 @@
+// apps/worker/src/api/v1/progress.ts
 import { Hono } from "hono";
 import type { ParsedEnv } from "../../env";
 import { requireTelegramAuth, type AuthContextVars } from "../../security/tgAuth";
@@ -6,14 +7,13 @@ import { getProgress, upsertProgressIdempotent } from "../../db/progress";
 type Bindings = ParsedEnv;
 
 function isBase64(s: string): boolean {
-  // Strict enough for v0. Also keeps inputs bounded by PAYLOAD_MAX_BYTES in worker middleware.
   return /^[A-Za-z0-9+/=]+$/.test(s) && s.length <= 200000;
 }
 
 export const progressApi = new Hono<{ Bindings: Bindings; Variables: AuthContextVars }>();
 
 progressApi.get("/v1/progress/:pageId", requireTelegramAuth(), async (c) => {
-  const userId = c.get("tgUserId");
+  const userId = c.get("tgUserId"); // string
   const pageId = c.req.param("pageId");
 
   const row = await getProgress(c.env.DB, userId, pageId);
@@ -21,15 +21,17 @@ progressApi.get("/v1/progress/:pageId", requireTelegramAuth(), async (c) => {
 });
 
 progressApi.put("/v1/progress/:pageId", requireTelegramAuth(), async (c) => {
-  const userId = c.get("tgUserId");
+  const userId = c.get("tgUserId"); // string
   const pageId = c.req.param("pageId");
 
-  const body = await c.req.json<{
-    contentHash: string;
-    clientRev: number;
-    dataB64: string;
-    timeSpentSec?: number;
-  }>().catch(() => null);
+  const body = await c
+    .req.json<{
+      contentHash: string;
+      clientRev: number;
+      dataB64: string;
+      timeSpentSec?: number;
+    }>()
+    .catch(() => null);
 
   if (!body) return c.json({ ok: false, error: "BAD_JSON" }, 400);
 

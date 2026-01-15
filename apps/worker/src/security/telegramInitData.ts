@@ -1,46 +1,74 @@
-type VerifyOk = {
+// apps/worker/src/security/telegramInitData.ts
+import { normalizeUserId } from "../util/userId";
+
+export type VerifyOk = {
   ok: true;
   authDate: number;
-  userId?: number;
+  userId: string; // canonical digits-only
   raw: Record<string, string>;
 };
 
-type VerifyErr =
+export type VerifyErr =
   | { ok: false; reason: "missing_init_data" }
   | { ok: false; reason: "missing_bot_token" }
   | { ok: false; reason: "malformed_init_data" }
   | { ok: false; reason: "missing_hash" }
   | { ok: false; reason: "expired" }
-  | { ok: false; reason: "invalid_signature" };
+  | { ok: false; reason: "invalid_signature" }
+  | { ok: false; reason: "missing_user" }
+  | { ok: false; reason: "invalid_user_id" };
 
 const te = new TextEncoder();
 
 function toHex(bytes: ArrayBuffer): string {
   const u8 = new Uint8Array(bytes);
   let out = "";
-  for (let i = 0; i < u8.length; i++) out += u8[i]!.toString(16).padStart(2, "0");
+  for (let i = 0; i < u8.length; i++) {
+    const b = u8[i];
+    if (b === undefined) continue;
+    out += b.toString(16).padStart(2, "0");
+  }
   return out;
+}
+
+function toArrayBuffer(view: Uint8Array): ArrayBuffer {
+  const copy = new Uint8Array(view.byteLength);
+  copy.set(view);
+  return copy.buffer;
 }
 
 async function hmacSha256(keyBytes: Uint8Array, msg: string): Promise<ArrayBuffer> {
   const key = await crypto.subtle.importKey(
     "raw",
-    keyBytes,
+    toArrayBuffer(keyBytes),
     { name: "HMAC", hash: "SHA-256" },
     false,
     ["sign"],
   );
-  return crypto.subtle.sign("HMAC", key, te.encode(msg));
+  const data = te.encode(msg);
+  return crypto.subtle.sign("HMAC", key, toArrayBuffer(data));
+}
+
+function buildRawMap(params: URLSearchParams): Record<string, string> {
+  const raw: Record<string, string> = {};
+  params.forEach((v, k) => {
+    raw[k] = v;
+  });
+  return raw;
+}
+
+function buildDataCheckString(params: URLSearchParams): string {
+  const pairs: string[] = [];
+  params.forEach((v, k) => {
+    if (k === "hash") return;
+    pairs.push(`${k}=${v}`);
+  });
+  pairs.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  return pairs.join("\n");
 }
 
 /**
  * Telegram Mini Apps initData verification (WebAppData).
- * Algorithm:
- * 1) data_check_string: sort params except "hash" by key, join as "k=v\n"
- * 2) secret_key = HMAC_SHA256(key="WebAppData", msg=botToken)
- * 3) signature = hex(HMAC_SHA256(key=secret_key, msg=data_check_string))
- * 4) signature must equal "hash"
- * 5) auth_date must be within maxAgeSec
  */
 export async function verifyTelegramInitData(
   initData: string,
@@ -61,46 +89,38 @@ export async function verifyTelegramInitData(
   const hash = params.get("hash");
   if (!hash) return { ok: false, reason: "missing_hash" };
 
-  // Build raw map (decoded values, as URLSearchParams returns decoded strings)
-  const raw: Record<string, string> = {};
-  for (const [k, v] of params.entries()) raw[k] = v;
+  const raw = buildRawMap(params);
 
   // TTL check
   const authDateStr = params.get("auth_date");
   const authDate = authDateStr ? Number(authDateStr) : 0;
   if (!Number.isFinite(authDate) || authDate <= 0) return { ok: false, reason: "expired" };
-  if (nowSec - authDate > maxAgeSec) return { ok: false, reason: "expired" };
-  if (authDate - nowSec > 60) return { ok: false, reason: "expired" }; // clock skew guard
 
-  // data_check_string
-  const entries: Array<[string, string]> = [];
-  for (const [k, v] of params.entries()) {
-    if (k === "hash") continue;
-    entries.push([k, v]);
-  }
-  entries.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
-  const dataCheckString = entries.map(([k, v]) => `${k}=${v}`).join("\n");
+  const maxAge = Math.max(0, Number(maxAgeSec || 0));
+  if (maxAge > 0 && nowSec - authDate > maxAge) return { ok: false, reason: "expired" };
 
-  // secret_key = HMAC_SHA256("WebAppData", botToken)
+  // Clock skew guard
+  if (authDate - nowSec > 60) return { ok: false, reason: "expired" };
+
+  const dataCheckString = buildDataCheckString(params);
+
   const secretKey = await hmacSha256(te.encode("WebAppData"), botToken);
-
-  // signature = HMAC_SHA256(secretKey, data_check_string)
   const signature = await hmacSha256(new Uint8Array(secretKey), dataCheckString);
   const signatureHex = toHex(signature);
 
-  if (signatureHex !== hash) return { ok: false, reason: "invalid_signature" };
+  if (signatureHex !== hash.toLowerCase()) return { ok: false, reason: "invalid_signature" };
 
-  // optional user id
-  let userId: number | undefined = undefined;
   const userRaw = params.get("user");
-  if (userRaw) {
-    try {
-      const u = JSON.parse(userRaw) as { id?: number };
-      if (typeof u.id === "number") userId = u.id;
-    } catch {
-      // ignore
-    }
+  if (!userRaw) return { ok: false, reason: "missing_user" };
+
+  let userId = "";
+  try {
+    const u = JSON.parse(userRaw) as { id?: unknown };
+    userId = normalizeUserId(u?.id);
+  } catch {
+    userId = "";
   }
+  if (!userId) return { ok: false, reason: "invalid_user_id" };
 
   return { ok: true, authDate, userId, raw };
 }

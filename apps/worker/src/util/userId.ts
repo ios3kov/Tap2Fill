@@ -1,13 +1,15 @@
-export function normalizeUserId(value: unknown): string {
-  const s = String(value ?? "").trim();
-  if (!s) throw new Error("missing_user_id");
+// apps/worker/src/util/userId.ts
+// Canonical Telegram user_id representation for storage and routing.
+// We store it as a digits-only string to avoid "92286330.0" bugs and ensure cross-runtime stability.
 
-  // If it came as "123.0" or similar, take the integer part.
-  const base = s.split(".")[0] ?? "";
+export function normalizeUserId(input: unknown): string {
+  const s = String(input ?? "").trim();
+  const m = s.match(/^\d+/);
+  return m?.[0] ?? "";
+}
 
-  // Keep digits only (Telegram user id is numeric).
-  const digits = base.replace(/[^\d]/g, "");
-  if (!digits) throw new Error("invalid_user_id");
-
-  return digits;
+export function assertUserId(input: unknown): string {
+  const id = normalizeUserId(input);
+  if (!id) throw new Error("USER_ID_INVALID");
+  return id;
 }

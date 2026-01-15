@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { getInitData, isTma, tmaBootstrap } from "../lib/tma";
-import { putMeState } from "../lib/api";
+import { getMeState, putMeState, type MeState, hasTelegramInitData } from "../lib/api";
 import {
   deletePageSnapshot,
   loadLastPageId,
@@ -9,18 +9,30 @@ import {
   savePageSnapshot,
   type PageSnapshotV1,
 } from "../local/snapshot";
+import { clearPendingMeState, enqueueMeState, loadPendingMeState } from "../local/outbox";
 
 const DEMO_PAGE_ID = "page_demo_1";
-const DEMO_CONTENT_HASH = "demo_hash_v1"; // later: real content_hash from pages catalog
+const DEMO_CONTENT_HASH = "demo_hash_v1";
+
+function safeJson(x: unknown): string {
+  try {
+    return JSON.stringify(x);
+  } catch {
+    return String(x);
+  }
+}
 
 export default function App() {
   const [out, setOut] = useState("idle");
   const [tick, setTick] = useState(0);
 
-  // Local-first state (restored from IndexedDB on boot)
+  // Local-first state
   const [clientRev, setClientRev] = useState(0);
   const [demoCounter, setDemoCounter] = useState(0);
   const [lastPageId, setLastPageId] = useState<string | null>(null);
+
+  // Visibility: server
+  const [serverState, setServerState] = useState<MeState | null>(null);
 
   useEffect(() => {
     tmaBootstrap();
@@ -29,7 +41,11 @@ export default function App() {
     return () => window.clearInterval(id);
   }, []);
 
-  // Restore local snapshots on open (no network required).
+  const initDataLen = useMemo(() => getInitData().length, [tick]);
+  const runtimeLabel = isTma() ? "Telegram Mini App" : "Web (standalone)";
+  const canCallServer = hasTelegramInitData();
+
+  // Restore local snapshots (no network)
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -48,20 +64,130 @@ export default function App() {
     };
   }, []);
 
-  const initDataLen = useMemo(() => getInitData().length, [tick]);
-  const runtimeLabel = isTma() ? "Telegram Mini App" : "Web (standalone)";
+  /**
+   * Server restore (pull on start):
+   * If server.clientRev > local.clientRev -> apply locally.
+   */
+  useEffect(() => {
+    let cancelled = false;
+
+    (async () => {
+      if (!canCallServer) return;
+
+      try {
+        const res = await getMeState(); // returns normalized MeState|null
+        if (cancelled) return;
+
+        setServerState(res.state);
+
+        const st = res.state;
+        if (!st) return;
+
+        if (st.clientRev > clientRev) {
+          setClientRev(st.clientRev);
+          setLastPageId(st.lastPageId);
+
+          // We keep demoCounter local; snapshot exists to track rev + restore.
+          const snap: PageSnapshotV1 = {
+            schemaVersion: 1,
+            pageId: DEMO_PAGE_ID,
+            contentHash: DEMO_CONTENT_HASH,
+            clientRev: st.clientRev,
+            demoCounter,
+            updatedAtMs: Date.now(),
+          };
+          await savePageSnapshot(snap);
+          await saveLastPageId(st.lastPageId);
+        }
+      } catch (e) {
+        setOut((prev) => (prev === "idle" ? `WARN: server restore failed: ${(e as Error).message}` : prev));
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canCallServer, clientRev, demoCounter]);
+
+  /**
+   * Batched sync (debounced push).
+   */
+  const flushTimerRef = useRef<number | null>(null);
+  const flushingRef = useRef(false);
+
+  async function flushOutboxOnce(): Promise<void> {
+    if (!canCallServer) return;
+    if (flushingRef.current) return;
+
+    const pending = await loadPendingMeState();
+    if (!pending) return;
+
+    flushingRef.current = true;
+    try {
+      const res = await putMeState({ lastPageId: pending.lastPageId, clientRev: pending.clientRev });
+      setServerState(res.state);
+
+      // Clear if server acknowledged >= our rev
+      if (res.state && res.state.clientRev >= pending.clientRev) {
+        await clearPendingMeState();
+      }
+    } catch {
+      // keep pending; retry later
+    } finally {
+      flushingRef.current = false;
+    }
+  }
+
+  async function scheduleFlush(delayMs: number): Promise<void> {
+    if (!canCallServer) return;
+
+    if (flushTimerRef.current !== null) {
+      window.clearTimeout(flushTimerRef.current);
+      flushTimerRef.current = null;
+    }
+
+    flushTimerRef.current = window.setTimeout(() => {
+      flushTimerRef.current = null;
+      void flushOutboxOnce();
+    }, delayMs);
+  }
+
+  // On boot: attempt to flush pending outbox (best-effort).
+  useEffect(() => {
+    if (!canCallServer) return;
+    void flushOutboxOnce();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canCallServer]);
 
   async function runSmokePutState() {
     setOut("calling...");
     try {
-      const res = await putMeState(DEMO_PAGE_ID);
-      setOut(`OK: ${JSON.stringify(res)}`);
+      const res = await putMeState({ lastPageId: DEMO_PAGE_ID, clientRev });
+      setServerState(res.state);
+      setOut(`OK: ${safeJson(res)}`);
     } catch (e) {
       setOut(`ERR: ${(e as Error).message}`);
     }
   }
 
-  // Local-first "action": increments local state and immediately snapshots to IndexedDB.
+  async function testIdempotencySameClientRev() {
+    setOut("calling same clientRev...");
+    const fixedRev = clientRev; // DO NOT increase
+    try {
+      const a = await putMeState({ lastPageId: "page_A", clientRev: fixedRev });
+      const b = await putMeState({ lastPageId: "page_B", clientRev: fixedRev });
+      setServerState(b.state);
+
+      setOut(
+        `OK:\n1) ${safeJson(a)}\n2) ${safeJson(b)}\n\nEXPECTED: lastPageId remains "page_A" after second call`,
+      );
+    } catch (e) {
+      setOut(`ERR: ${(e as Error).message}`);
+    }
+  }
+
+  // Local-first action: snapshot immediately + enqueue server write + schedule batched push
   async function simulateLocalAction() {
     const nextRev = clientRev + 1;
     const nextCounter = demoCounter + 1;
@@ -82,20 +208,27 @@ export default function App() {
     const newLast = DEMO_PAGE_ID;
     setLastPageId(newLast);
     await saveLastPageId(newLast);
+
+    await enqueueMeState(newLast, nextRev);
+    await scheduleFlush(600);
   }
 
   async function resetLocal() {
     await deletePageSnapshot(DEMO_PAGE_ID, DEMO_CONTENT_HASH);
     await saveLastPageId(null);
+    await clearPendingMeState();
+
     setClientRev(0);
     setDemoCounter(0);
     setLastPageId(null);
+    setServerState(null);
+    setOut("idle");
   }
 
   return (
     <div style={{ padding: 16, fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial" }}>
       <h1 style={{ margin: 0 }}>Tap2Fill</h1>
-      <p style={{ opacity: 0.7, marginTop: 6 }}>Local-first (IndexedDB) snapshot + restore</p>
+      <p style={{ opacity: 0.7, marginTop: 6 }}>Local-first + server restore + batched sync</p>
 
       <div style={{ border: "1px solid rgba(127,127,127,0.25)", borderRadius: 14, padding: 14 }}>
         <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
@@ -123,6 +256,17 @@ export default function App() {
           </div>
         </div>
 
+        <div style={{ marginTop: 12, padding: 12, borderRadius: 12, background: "rgba(127,127,127,0.06)" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+            <span>Server lastPageId</span>
+            <strong>{serverState?.lastPageId ?? "null"}</strong>
+          </div>
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 12, marginTop: 6 }}>
+            <span>Server clientRev</span>
+            <strong>{serverState?.clientRev ?? 0}</strong>
+          </div>
+        </div>
+
         <button
           onClick={simulateLocalAction}
           style={{
@@ -135,7 +279,41 @@ export default function App() {
             fontWeight: 650,
           }}
         >
-          Simulate Local Action (snapshot to IndexedDB)
+          Simulate Local Action (snapshot + enqueue sync)
+        </button>
+
+        <button
+          onClick={testIdempotencySameClientRev}
+          disabled={!canCallServer}
+          style={{
+            marginTop: 10,
+            width: "100%",
+            padding: "10px 12px",
+            borderRadius: 12,
+            border: "1px solid rgba(127,127,127,0.35)",
+            background: "transparent",
+            fontWeight: 650,
+            opacity: !canCallServer ? 0.5 : 0.9,
+          }}
+        >
+          Test Idempotency (same clientRev)
+        </button>
+
+        <button
+          onClick={runSmokePutState}
+          disabled={!canCallServer}
+          style={{
+            marginTop: 10,
+            width: "100%",
+            padding: "10px 12px",
+            borderRadius: 12,
+            border: "1px solid rgba(127,127,127,0.35)",
+            background: "transparent",
+            fontWeight: 650,
+            opacity: !canCallServer ? 0.5 : 1,
+          }}
+        >
+          Run Smoke Test (PUT /v1/me/state)
         </button>
 
         <button
@@ -152,23 +330,6 @@ export default function App() {
           }}
         >
           Reset Local Snapshot
-        </button>
-
-        <button
-          onClick={runSmokePutState}
-          disabled={initDataLen === 0}
-          style={{
-            marginTop: 12,
-            width: "100%",
-            padding: "10px 12px",
-            borderRadius: 12,
-            border: "1px solid rgba(127,127,127,0.35)",
-            background: "transparent",
-            fontWeight: 650,
-            opacity: initDataLen === 0 ? 0.5 : 1,
-          }}
-        >
-          Run Smoke Test (PUT /v1/me/state)
         </button>
 
         <pre style={{ marginTop: 12, padding: 10, borderRadius: 12, background: "rgba(127,127,127,0.10)" }}>

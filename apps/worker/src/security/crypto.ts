@@ -1,31 +1,44 @@
-export function timingSafeEqual(a: Uint8Array, b: Uint8Array): boolean {
-  if (a.length !== b.length) return false
-  let diff = 0
-  for (let i = 0; i < a.length; i++) diff |= (a[i] ?? 0) ^ (b[i] ?? 0)
-  return diff === 0
+// apps/worker/src/security/crypto.ts
+const te = new TextEncoder();
+
+/**
+ * Convert ArrayBuffer to lowercase hex string.
+ * Safe under `noUncheckedIndexedAccess`.
+ */
+export function toHex(bytes: ArrayBuffer): string {
+  const u8 = new Uint8Array(bytes);
+  let out = "";
+  for (let i = 0; i < u8.length; i++) {
+    const b = u8[i];
+    if (b === undefined) continue;
+    out += b.toString(16).padStart(2, "0");
+  }
+  return out;
 }
 
-export function utf8(s: string): Uint8Array {
-  return new TextEncoder().encode(s)
+/**
+ * Convert Uint8Array view into a standalone ArrayBuffer (copy).
+ * Guarantees ArrayBuffer type (avoids ArrayBuffer|SharedArrayBuffer unions).
+ */
+export function toArrayBuffer(view: Uint8Array): ArrayBuffer {
+  const copy = new Uint8Array(view.byteLength);
+  copy.set(view);
+  return copy.buffer;
 }
 
-export async function hmacSha256(
-  key: Uint8Array,
-  data: Uint8Array,
-): Promise<Uint8Array> {
+/**
+ * HMAC_SHA256(keyBytes, msg) -> ArrayBuffer signature.
+ * Type-safe for CF Workers + strict TS.
+ */
+export async function hmacSha256(keyBytes: Uint8Array, msg: string): Promise<ArrayBuffer> {
   const cryptoKey = await crypto.subtle.importKey(
     "raw",
-    key,
+    toArrayBuffer(keyBytes),
     { name: "HMAC", hash: "SHA-256" },
     false,
     ["sign"],
-  )
-  const sig = await crypto.subtle.sign("HMAC", cryptoKey, data)
-  return new Uint8Array(sig)
-}
+  );
 
-export function toHex(bytes: Uint8Array): string {
-  return Array.from(bytes, (b) => (b ?? 0).toString(16).padStart(2, "0")).join(
-    "",
-  )
+  const data = te.encode(msg);
+  return crypto.subtle.sign("HMAC", cryptoKey, toArrayBuffer(data));
 }

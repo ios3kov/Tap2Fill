@@ -1,14 +1,15 @@
+// apps/worker/src/bot/webhook.ts
 import type { Env } from "../env";
 import { makeBot } from "./bot";
 
 type JsonObject = Record<string, unknown>;
 
-function safeJsonStringify(v: unknown): string {
-  try {
-    return JSON.stringify(v);
-  } catch {
-    return "[unserializable]";
-  }
+function isObject(v: unknown): v is JsonObject {
+  return typeof v === "object" && v !== null;
+}
+
+function hasUpdateId(v: JsonObject): v is JsonObject & { update_id: number } {
+  return typeof v.update_id === "number";
 }
 
 export async function handleBotWebhook(req: Request, env: Env): Promise<Response> {
@@ -25,18 +26,22 @@ export async function handleBotWebhook(req: Request, env: Env): Promise<Response
       return new Response("OK", { status: 200 });
     }
 
-    const update = (await req.json().catch((e) => {
+    const parsed = await req.json().catch((e) => {
       console.error("[bot] failed to parse json:", String(e));
       return null;
-    })) as JsonObject | null;
+    });
 
-    if (!update) return new Response("OK", { status: 200 });
+    if (!isObject(parsed)) return new Response("OK", { status: 200 });
+    if (!hasUpdateId(parsed)) return new Response("OK", { status: 200 });
 
     const bot = makeBot(env);
 
-    await bot.handleUpdate(update).catch((e) => {
+    // Avoid `any`: bridge unknown into the handler's expected input type.
+    type UpdateParam = Parameters<typeof bot.handleUpdate>[0];
+    const update = parsed as unknown as UpdateParam;
+
+    await bot.handleUpdate(update).catch((e: unknown) => {
       console.error("[bot] handleUpdate error:", String(e));
-      // Do not propagate to Telegram
     });
 
     return new Response("OK", { status: 200 });
