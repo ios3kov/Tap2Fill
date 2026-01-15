@@ -1,35 +1,53 @@
-import { useState } from "react"
-import reactLogo from "./assets/react.svg"
-import viteLogo from "/vite.svg"
-import "./App.css"
+import { useEffect, useState } from "react";
+import { isTma, tmaBootstrap } from "./lib/tma";
+import { putMeState } from "./lib/api";
 
-function App() {
-  const [count, setCount] = useState(0)
+export default function App() {
+  const [out, setOut] = useState("idle");
+
+  useEffect(() => {
+    tmaBootstrap();
+  }, []);
+
+  async function run() {
+    setOut("calling...");
+    try {
+      const res = await putMeState("page_demo_1");
+      setOut(`OK: ${JSON.stringify(res)}`);
+    } catch (e) {
+      setOut(`ERR: ${(e as Error).message}`);
+    }
+  }
 
   return (
-    <>
-      <div>
-        <a href="https://vite.dev" target="_blank">
-          <img src={viteLogo} className="logo" alt="Vite logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <h1>Vite + React</h1>
-      <div className="card">
-        <button onClick={() => setCount((count) => count + 1)}>
-          count is {count}
-        </button>
-        <p>
-          Edit <code>src/App.tsx</code> and save to test HMR
-        </p>
-      </div>
-      <p className="read-the-docs">
-        Click on the Vite and React logos to learn more
-      </p>
-    </>
-  )
-}
+    <div style={{ padding: 16, fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial" }}>
+      <h1 style={{ margin: 0 }}>Tap2Fill</h1>
+      <p style={{ opacity: 0.7, marginTop: 6 }}>Runtime D1 auth/write smoke test</p>
 
-export default App
+      <button
+        onClick={run}
+        disabled={!isTma()}
+        style={{
+          width: "100%",
+          padding: "10px 12px",
+          borderRadius: 12,
+          border: "1px solid rgba(127,127,127,0.35)",
+          background: "transparent",
+          fontWeight: 650,
+        }}
+      >
+        Run Smoke Test (PUT /v1/me/state)
+      </button>
+
+      {!isTma() && (
+        <p style={{ marginTop: 10, opacity: 0.7 }}>
+          Open inside Telegram Mini App to run (initData exists only there).
+        </p>
+      )}
+
+      <pre style={{ marginTop: 12, padding: 10, borderRadius: 12, background: "rgba(127,127,127,0.10)" }}>
+        {out}
+      </pre>
+    </div>
+  );
+}

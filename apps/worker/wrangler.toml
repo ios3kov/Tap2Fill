@@ -15,8 +15,14 @@ RATE_LIMIT_MAX_REQUESTS = "120"
 # [[d1_databases]]
 # binding = "DB"
 # database_name = "tap2fill-db"
-# database_id = "REPLACE_ME"
+# database_id = "e1199efd-4ddc-4c28-a7d5-3ef1217b1dc4"
 #
 # [[r2_buckets]]
 # binding = "ASSETS"
 # bucket_name = "tap2fill-assets"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "tap2fill-db"
+database_id = "f7b6a685-6ac5-4381-84b0-078154a34d9c"
+

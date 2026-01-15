@@ -1,24 +1,12 @@
-export type TmaThemeParams = Record<string, string>;
-
 export type TmaWebApp = {
   ready: () => void;
   expand: () => void;
   initData?: string;
-  themeParams?: TmaThemeParams;
 };
-
-export type TmaWindow = {
-  Telegram?: {
-    WebApp?: TmaWebApp;
-  };
-};
-
-function getWindow(): TmaWindow {
-  return window as unknown as TmaWindow;
-}
 
 export function getWebApp(): TmaWebApp | null {
-  return getWindow().Telegram?.WebApp ?? null;
+  const w = window as unknown as { Telegram?: { WebApp?: TmaWebApp } };
+  return w.Telegram?.WebApp ?? null;
 }
 
 export function isTma(): boolean {
@@ -32,6 +20,6 @@ export function tmaBootstrap(): void {
     wa.ready();
     wa.expand();
   } catch {
-    // Never crash the app due to Telegram bridge issues.
+    // no-op
   }
 }
