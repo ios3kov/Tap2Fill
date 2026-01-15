@@ -37,9 +37,35 @@
   gap: 12px;
 }
 
+.button {
+  margin-top: 12px;
+  width: 100%;
+  border: 1px solid rgba(127, 127, 127, 0.35);
+  background: transparent;
+  border-radius: 12px;
+  padding: 10px 12px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 .note {
   margin-top: 10px;
   opacity: 0.75;
   font-size: 14px;
+  line-height: 1.35;
+}
+
+.pre {
+  margin-top: 12px;
+  padding: 10px;
+  border-radius: 12px;
+  background: rgba(127, 127, 127, 0.10);
+  overflow: auto;
+  font-size: 12px;
   line-height: 1.35;
 }
