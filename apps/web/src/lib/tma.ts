@@ -13,6 +13,10 @@ export function isTma(): boolean {
   return Boolean(getWebApp());
 }
 
+export function getInitData(): string {
+  return String(getWebApp()?.initData ?? "");
+}
+
 export function tmaBootstrap(): void {
   const wa = getWebApp();
   if (!wa) return;
