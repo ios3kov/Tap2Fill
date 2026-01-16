@@ -53,7 +53,7 @@ const DEMO_REGION_ORDER: readonly string[] = Array.from(
 )
 
 // Undo policy (Stage 3)
-const UNDO_BUDGET_PER_SESSION = 5
+const UNDO_BUDGET_PER_SESSION = 512
 
 export default function App() {
   const [out, setOut] = useState("idle")
