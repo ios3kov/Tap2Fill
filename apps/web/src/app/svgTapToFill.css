@@ -190,3 +190,199 @@
     transition: none;
   }
 }
+/* apps/web/src/app/svgTapToFill.css
+ *
+ * Stage 2 — SVG Tap-to-Fill pointer policy + minimal UI primitives.
+ *
+ * Contract:
+ * - Root SVG marked by svgTapToFill.ts with: data-page-root="1"
+ * - Clickable regions: [data-region="R###"]
+ * - Non-interactive decoration/outline: [data-role="outline"]
+ *
+ * Pointer-events policy (robust across SVG structures):
+ * - Keep root <svg> hittable so elementFromPoint can return SVG nodes.
+ * - Do NOT globally disable pointer-events for all children (breaks many SVGs where
+ *   data-region is on <g> and the painted <path> is the actual hit target).
+ * - Explicitly enable regions and their drawable descendants.
+ *
+ * Wrapper policy (zoom/pan):
+ * - Make intermediate wrappers transparent for hit-testing,
+ *   but DO NOT touch the handler container (.t2f-canvas / .zp-container).
+ */
+
+/* ===== Pointer-events hardening (core) ===== */
+
+[data-page-root] {
+  display: block;
+  width: 100%;
+  height: auto;
+
+  /* Keep root hittable so descendants can be discovered by elementFromPoint */
+  pointer-events: auto;
+
+  /* Hardening: prevent accidental selection/drags */
+  user-select: none;
+  -webkit-user-select: none;
+
+  /* Prevent iOS context menu on long-press */
+  -webkit-touch-callout: none;
+
+  /* Performance: isolate paint/layout; safe for embedded SVG usage */
+  contain: layout paint;
+}
+
+/* Non-interactive decoration/outline must never intercept pointer events */
+[data-page-root] [data-role="outline"] {
+  pointer-events: none;
+}
+
+/* Ensure region AND its drawable descendants are hittable */
+[data-page-root] [data-region],
+[data-page-root] [data-region] * {
+  pointer-events: all;
+
+  /* UX: signal interactivity; safe for desktop. Mobile ignores cursor. */
+  cursor: pointer;
+
+  /* iOS: remove gray tap highlight */
+  -webkit-tap-highlight-color: transparent;
+
+  /* Optional: responsive feel without heavy cost */
+  transition: fill 0.15s ease-out;
+}
+
+/*
+ * Ghost Path hardening (conditional):
+ * Apply transparent fill ONLY when author didn't specify fill,
+ * OR when fill is explicitly "none" (common in exported SVGs).
+ *
+ * This stabilizes hit-testing without overriding authored/animated fills.
+ */
+[data-page-root] [data-region]:not([fill]),
+[data-page-root] [data-region][fill="none"],
+[data-page-root] [data-region] *:not([fill]),
+[data-page-root] [data-region] *[fill="none"] {
+  fill: transparent;
+}
+
+/* Optional: prevent outlines inside regions from capturing events if authoring mistakes occur */
+[data-page-root] [data-region] [data-role="outline"] {
+  pointer-events: none;
+}
+
+/* ===== Zoom/Pan wrappers (must not block elementFromPoint) ===== */
+
+/* These wrappers should not intercept hit-testing; handlers live on .t2f-canvas/.zp-container */
+.zp-content,
+.t2f-svgHost {
+  pointer-events: none;
+}
+
+/* ===== Tap surface helpers (optional but useful) ===== */
+
+/* Use on the container that hosts the SVG (recommended: a wrapper <div>) */
+.t2f-canvas {
+  border-radius: 14px;
+  border: 1px solid rgba(127, 127, 127, 0.25);
+  background: rgba(127, 127, 127, 0.06);
+  padding: 10px;
+
+  /* Mobile: allow taps but avoid pinch/scroll conflicts; zoomPan engine handles gestures */
+  touch-action: none;
+}
+
+/* Host that receives the mounted SVG (App.tsx sets aspect ratio + centering) */
+.t2f-svgHost {
+  width: 100%;
+  max-width: 520px;
+  margin: 0 auto;
+  aspect-ratio: 1 / 1;
+  display: grid;
+  place-items: center;
+}
+
+/* ===== Optional small UI primitives used by App.tsx (kept neutral) ===== */
+
+.t2f-card {
+  border: 1px solid rgba(127, 127, 127, 0.25);
+  border-radius: 14px;
+  padding: 14px;
+}
+
+.t2f-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.t2f-rowMuted {
+  opacity: 0.8;
+}
+
+.t2f-panel {
+  padding: 12px;
+  border-radius: 12px;
+  background: rgba(127, 127, 127, 0.08);
+}
+
+.t2f-panelAlt {
+  background: rgba(127, 127, 127, 0.06);
+}
+
+.t2f-btn {
+  width: 100%;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(127, 127, 127, 0.35);
+  background: transparent;
+  font-weight: 650;
+}
+
+.t2f-pre {
+  padding: 10px;
+  border-radius: 12px;
+  background: rgba(127, 127, 127, 0.1);
+  overflow: auto;
+}
+
+.t2f-footnote {
+  font-size: 12px;
+  opacity: 0.65;
+}
+
+.t2f-palette {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.t2f-swatch {
+  width: 32px;
+  height: 32px;
+  border-radius: 10px;
+  border: 1px solid rgba(127, 127, 127, 0.25);
+}
+
+.t2f-swatchActive {
+  border: 2px solid rgba(127, 127, 127, 0.85);
+}
+
+.t2f-activeColor {
+  margin-left: auto;
+  opacity: 0.75;
+  font-size: 13px;
+}
+
+.t2f-meta {
+  font-size: 13px;
+  opacity: 0.85;
+}
+
+/* Accessibility: reduce any future transitions/animations if added */
+@media (prefers-reduced-motion: reduce) {
+  [data-page-root] [data-region],
+  [data-page-root] [data-region] * {
+    transition: none;
+  }
+}
