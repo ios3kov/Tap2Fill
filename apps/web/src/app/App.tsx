@@ -53,7 +53,18 @@ const DEMO_REGION_ORDER: readonly string[] = Array.from(
 )
 
 // Undo policy (Stage 3)
-const UNDO_BUDGET_PER_SESSION = 512
+// Contract: in useUndoHistory, budgetPerSession <= 0 means "unlimited".
+const UNDO_BUDGET_PER_SESSION = 0
+
+type CommitInput = {
+  nextFills: FillMap
+  nextProgressB64: string
+  nextPaletteIdx: number
+  tapLabel: string
+  // Optional override for history snapshot persistence (used by undo).
+  nextUndoStackB64?: string[]
+  nextUndoUsed?: number
+}
 
 export default function App() {
   const [out, setOut] = useState("idle")
@@ -85,6 +96,9 @@ export default function App() {
   // Page UX: confirm + reward overlay
   const [confirmResetOpen, setConfirmResetOpen] = useState(false)
   const [rewardDismissed, setRewardDismissed] = useState(false)
+
+  // Prevent overlapping commit() calls (race conditions on slow persistence/outbox).
+  const isCommittingRef = useRef(false)
 
   // Derived state: no setState-in-effect
   const percent = useMemo(() => {
@@ -237,9 +251,13 @@ export default function App() {
     setIsGesturing,
   })
 
-  function activeColor(): string {
-    return DEMO_PALETTE[safeColorIndex(paletteIdx, DEMO_PALETTE)]
-  }
+  /**
+   * Memoized: stable identity for downstream hooks.
+   * Uses paletteIdxRef.current to avoid re-creating callback when palette changes.
+   */
+  const activeColor = useCallback((): string => {
+    return DEMO_PALETTE[safeColorIndex(paletteIdxRef.current, DEMO_PALETTE)]
+  }, [])
 
   /**
    * Commit local mutation = бизнес-операция:
@@ -247,48 +265,57 @@ export default function App() {
    * - сохраняет snapshot
    * - ставит в outbox и планирует flush
    *
-   * Не useCallback: избегаем react-hooks/preserve-manual-memoization,
-   * т.к. внутри используются ref.current зависимости.
+   * Concurrency:
+   * - guarded by isCommittingRef to prevent overlapping commits if persistence is slow.
+   *
+   * Note: this is intentionally not useCallback; it uses multiple refs and stays readable.
    */
-  async function commit(m: {
-    nextFills: FillMap
-    nextProgressB64: string
-    nextPaletteIdx: number
-    tapLabel: string
-    // Optional override for history snapshot persistence (used by undo).
-    nextUndoStackB64?: string[]
-    nextUndoUsed?: number
-  }): Promise<void> {
-    const nextClientRev = clientRevRef.current + 1
-    const nextDemoCounter = demoCounterRef.current + 1
+  async function commit(m: CommitInput): Promise<void> {
+    if (isCommittingRef.current) return
+    isCommittingRef.current = true
 
-    setClientRev(nextClientRev)
-    setDemoCounter(nextDemoCounter)
-    setFills(m.nextFills)
-    setProgressB64(m.nextProgressB64)
-    setPaletteIdx(m.nextPaletteIdx)
-    setLastTap(m.tapLabel)
+    try {
+      const nextClientRev = clientRevRef.current + 1
+      const nextDemoCounter = demoCounterRef.current + 1
 
-    const undoStackB64 = m.nextUndoStackB64 ?? history.refs.undoStackRef.current
-    const undoUsed = m.nextUndoUsed ?? history.refs.undoUsedRef.current
+      setClientRev(nextClientRev)
+      setDemoCounter(nextDemoCounter)
+      setFills(m.nextFills)
+      setProgressB64(m.nextProgressB64)
+      setPaletteIdx(m.nextPaletteIdx)
+      setLastTap(m.tapLabel)
 
-    await persistSnapshotNow({
-      nextClientRev,
-      nextDemoCounter,
-      nextPaletteIdx: m.nextPaletteIdx,
-      nextProgressB64: m.nextProgressB64,
-      nextUndoStackB64: undoStackB64,
-      nextUndoUsed: undoUsed,
-    })
+      // Keep refs in sync immediately for any code reading ref.current.
+      clientRevRef.current = nextClientRev
+      demoCounterRef.current = nextDemoCounter
+      paletteIdxRef.current = m.nextPaletteIdx
+      fillsRef.current = m.nextFills
+      progressB64Ref.current = m.nextProgressB64
 
-    setLastPageId(DEMO_PAGE_ID)
-    await saveLastPageId(DEMO_PAGE_ID)
+      const undoStackB64 =
+        m.nextUndoStackB64 ?? history.refs.undoStackRef.current
+      const undoUsed = m.nextUndoUsed ?? history.refs.undoUsedRef.current
 
-    await outbox.enqueueAndSchedule(
-      DEMO_PAGE_ID,
-      nextClientRev,
-      APP_CONFIG.network.flushDelayMs,
-    )
+      await persistSnapshotNow({
+        nextClientRev,
+        nextDemoCounter,
+        nextPaletteIdx: m.nextPaletteIdx,
+        nextProgressB64: m.nextProgressB64,
+        nextUndoStackB64: undoStackB64,
+        nextUndoUsed: undoUsed,
+      })
+
+      setLastPageId(DEMO_PAGE_ID)
+      await saveLastPageId(DEMO_PAGE_ID)
+
+      await outbox.enqueueAndSchedule(
+        DEMO_PAGE_ID,
+        nextClientRev,
+        APP_CONFIG.network.flushDelayMs,
+      )
+    } finally {
+      isCommittingRef.current = false
+    }
   }
 
   // Tap-to-fill UI handlers isolated (UI → domain → commit)
@@ -303,10 +330,11 @@ export default function App() {
     palette: DEMO_PALETTE,
     activeColor,
     pushUndoSnapshot: history.pushSnapshot,
-    commit,
+    commit, // strongly typed via CommitInput
   })
 
-  // Gallery progress placeholder
+  // Gallery progress placeholder (Stage 3)
+  // Intentionally empty for now; will be filled from snapshot storage when gallery becomes dynamic.
   const progressByPageId = useMemo<
     Record<string, { pageId: string; ratio: number; completed: boolean }>
   >(() => ({}), [])
@@ -342,6 +370,13 @@ export default function App() {
     setLastTap("none")
     setOut("idle")
 
+    // Keep refs in sync immediately.
+    clientRevRef.current = 0
+    demoCounterRef.current = 0
+    paletteIdxRef.current = 0
+    fillsRef.current = {}
+    progressB64Ref.current = ""
+
     const t = { scale: 1, tx: 0, ty: 0 }
     setTransform(t)
     const content = zoomContentRef.current
@@ -363,7 +398,6 @@ export default function App() {
     setConfirmResetOpen(false)
     setRewardDismissed(false)
 
-    // Keep budget, clear history
     history.resetKeepBudget()
 
     const nextFills: FillMap = {}
@@ -391,8 +425,6 @@ export default function App() {
 
     const { packedB64, nextStack, nextUsed } = pop
 
-    // Compute next fills from the popped snapshot.
-    // (We apply to DOM immediately for responsiveness; React state will follow via commit.)
     let nextFills: FillMap = {}
     if (packedB64) {
       nextFills = decodeProgressB64ToFillMap({
@@ -407,19 +439,6 @@ export default function App() {
     const host = svgHostRef.current
     if (host) applyFillsToContainer(host, nextFills)
 
-    /**
-     * Atomicity note (valid comment):
-     * Previously we did:
-     *   history.setFromRestore(...)  + commit(...)
-     * which creates two separate state updates. Instead, we persist the history
-     * state into the snapshot inside commit (via overrides), and then update
-     * the in-memory history once after commit completes.
-     *
-     * True "single transaction" would require pushing commit into the history hook.
-     * This implementation is the best compromise without changing hook APIs:
-     * - persisted snapshot is consistent (fills/progress + undo stack/used)
-     * - UI becomes consistent as soon as commit resolves
-     */
     await commit({
       nextFills,
       nextProgressB64: packedB64,
@@ -428,13 +447,16 @@ export default function App() {
       nextUndoStackB64: nextStack,
       nextUndoUsed: nextUsed,
     })
-
-    // Now align in-memory history state with what we just persisted.
-    // history.setFromRestore(nextStack, nextUsed)
   }
 
   const canUndo = history.canUndo
   const undoLeft = history.undoLeft
+
+  // UI: do not show Infinity. In unlimited mode we display "∞".
+  const unlimitedUndo = UNDO_BUDGET_PER_SESSION <= 0
+  const undoLeftLabel = unlimitedUndo
+    ? "∞"
+    : String(Number.isFinite(undoLeft) ? undoLeft : 0)
 
   return (
     <div
@@ -506,7 +528,7 @@ export default function App() {
               <span className="t2f-pageBarMeta">
                 Page <strong>{route.pageId}</strong> · {percent}%{" "}
                 {completed ? "· Completed" : ""} · Undo left{" "}
-                <strong>{undoLeft}</strong>
+                <strong>{undoLeftLabel}</strong>
               </span>
 
               <button
@@ -514,11 +536,7 @@ export default function App() {
                 disabled={!canUndo}
                 onClick={() => void undoOneBudgeted()}
                 aria-disabled={!canUndo}
-                title={
-                  !canUndo
-                    ? "Undo unavailable (no history or budget exhausted)"
-                    : "Undo"
-                }
+                title={!canUndo ? "Undo unavailable (no history)" : "Undo"}
               >
                 Undo
               </button>
@@ -640,6 +658,10 @@ export default function App() {
               <div className="t2f-row" style={{ marginTop: 6 }}>
                 <span>Undo used</span>
                 <strong>{history.undoBudgetUsed}</strong>
+              </div>
+              <div className="t2f-row" style={{ marginTop: 6 }}>
+                <span>Undo left</span>
+                <strong>{undoLeftLabel}</strong>
               </div>
             </div>
 

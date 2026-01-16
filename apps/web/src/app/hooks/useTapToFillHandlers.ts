@@ -5,23 +5,31 @@ import { APP_CONFIG } from "../config/appConfig"
 import type { FillMap } from "../coloring"
 import { clampInt } from "../domain/guards"
 import {
+  compilePackContext,
   encodeBytesToBase64,
   makeEmptyProgressBytes,
-  packFillMapToBytes,
+  packFillMapToBytesWithContext,
+  type PackContext,
 } from "../progress/pack"
 import { applyFillToRegion, hitTestRegionAtPoint } from "../svgTapToFill"
 
 /**
  * Tap-to-fill handlers (Stage 3)
  *
- * Key invariants (for Undo/Restore correctness):
- * - progressB64 is always the canonical "bytes-packed" base64 produced by packFillMapToBytes(...)
- * - empty page is also represented as bytes-packed base64 (NOT "")
- * - undo snapshots store the previous packed progressB64 (including "empty page" snapshot)
+ * Invariants (Undo/Restore correctness):
+ * - progressB64 is always canonical "bytes-packed" base64.
+ * - empty page is represented as bytes-packed base64 (NOT "").
+ * - undo snapshots store the previous packed progressB64 (including empty snapshot).
  *
  * Safety / resilience:
- * - ignores unknown regions/colors during packing (content updates won't crash clients)
- * - guards multi-touch and gesture mode to prevent accidental fills during zoom/pan
+ * - ignores unknown regions/colors during packing (content updates won't crash clients).
+ * - guards multi-touch and gesture mode to prevent accidental fills during zoom/pan.
+ *
+ * Performance:
+ * - compiles PackContext once (region/palette normalization + index maps) and reuses it on every tap.
+ *
+ * Concurrency:
+ * - prevents overlapping commits (race conditions) by locking during commit().
  */
 export function useTapToFillHandlers(params: {
   enabled: boolean
@@ -53,6 +61,9 @@ export function useTapToFillHandlers(params: {
 }) {
   const activeTouchIdsRef = useRef<Set<number>>(new Set())
 
+  // Prevent overlapping commit() calls (race conditions on slow persistence).
+  const isCommittingRef = useRef(false)
+
   const {
     enabled,
     isGesturingRef,
@@ -68,17 +79,33 @@ export function useTapToFillHandlers(params: {
   } = params
 
   /**
-   * Canonical empty snapshot for this page's region order length.
+   * Compile packing context once.
+   * In strict mode this will fail fast for broken inputs (duplicate/empty ids, etc).
+   */
+  const packCtx: PackContext = useMemo(() => {
+    return compilePackContext(regionOrder, palette, {
+      // Stage-3 expectation: canonical inputs should be stable and well-formed
+      strictInputs: true,
+      allowDuplicateRegionIds: false,
+      allowDuplicatePaletteColors: false,
+      // Resilience during packing:
+      ignoreUnknownRegions: true,
+      ignoreUnknownColors: true,
+    })
+  }, [regionOrder, palette])
+
+  /**
+   * Canonical empty snapshot for this page's regionsCount.
    * This prevents "undo looks like reset" due to empty/invalid base64.
    */
   const emptyProgressB64 = useMemo(() => {
-    const bytes = makeEmptyProgressBytes(regionOrder.length)
+    const bytes = makeEmptyProgressBytes(packCtx.regionsCount, packCtx.opts)
     return encodeBytesToBase64(bytes)
-  }, [regionOrder.length])
+  }, [packCtx.regionsCount, packCtx.opts])
 
   /**
-   * Stable getter to satisfy exhaustive-deps and ensure we always snapshot
-   * a valid packed progress (never empty string).
+   * Stable getter: always returns a valid packed progress (never empty string).
+   * Used for undo snapshots.
    */
   const getPrevPackedProgress = useCallback((): string => {
     const s = String(progressB64Ref.current ?? "").trim()
@@ -129,23 +156,36 @@ export function useTapToFillHandlers(params: {
       const touchPid = isTouch ? e.pointerId : null
 
       try {
+        // Ignore if zoom/pan gesture is active.
         if (isGesturingRef.current) return
+
+        // Only primary button for mouse/pen.
         if (!isTouch && typeof e.button === "number" && e.button !== 0) return
+
+        // If a commit is already in flight, drop this tap.
+        // This avoids races between multiple async commit() executions.
+        if (isCommittingRef.current) return
 
         const x = clampInt(e.clientX, 0, window.innerWidth)
         const y = clampInt(e.clientY, 0, window.innerHeight)
 
         if (isTouch) {
           if (!e.isPrimary) return
+
+          // Multi-touch = zoom/pan; do not treat as tap.
           if (activeTouchIdsRef.current.size >= 2) return
 
           await new Promise<void>((resolve) =>
             window.setTimeout(resolve, APP_CONFIG.ui.pointer.touchDebounceMs),
           )
 
+          // If pointer got canceled or another finger joined during debounce.
           if (!activeTouchIdsRef.current.has(e.pointerId)) return
           if (activeTouchIdsRef.current.size >= 2) return
           if (isGesturingRef.current) return
+
+          // Re-check commit lock after debounce.
+          if (isCommittingRef.current) return
         }
 
         const host = svgHostRef.current
@@ -157,13 +197,7 @@ export function useTapToFillHandlers(params: {
         })
 
         if (!hit) {
-          // No region hit; no history mutation.
-          await commit({
-            nextFills: fillsRef.current,
-            nextProgressB64: getPrevPackedProgress(),
-            nextPaletteIdx: paletteIdxRef.current,
-            tapLabel: "tap: no region",
-          })
+          // No region hit => no state mutation and no persistence.
           return
         }
 
@@ -174,6 +208,9 @@ export function useTapToFillHandlers(params: {
         // No-op tap: do nothing (no undo, no commit).
         if (prevColor === color) return
 
+        // From this point, we're going to commit. Lock.
+        isCommittingRef.current = true
+
         // Snapshot BEFORE mutation (undo must restore previous packed progress).
         pushUndoSnapshot(getPrevPackedProgress())
 
@@ -182,12 +219,8 @@ export function useTapToFillHandlers(params: {
 
         const nextFills: FillMap = { ...prevFills, [hit.regionId]: color }
 
-        // Canonical Stage-3 packing: FillMap -> bytes -> base64
-        const nextBytes = packFillMapToBytes(nextFills, regionOrder, palette, {
-          // strict enough to be safe, resilient to minor content diffs
-          ignoreUnknownRegions: true,
-          ignoreUnknownColors: true,
-        })
+        // Canonical Stage-3 packing (fast path): FillMap -> bytes -> base64
+        const nextBytes = packFillMapToBytesWithContext(nextFills, packCtx)
         const nextProgressB64 = encodeBytesToBase64(nextBytes)
 
         await commit({
@@ -198,6 +231,7 @@ export function useTapToFillHandlers(params: {
         })
       } finally {
         if (touchPid !== null) activeTouchIdsRef.current.delete(touchPid)
+        isCommittingRef.current = false
       }
     },
     [
@@ -206,12 +240,11 @@ export function useTapToFillHandlers(params: {
       svgHostRef,
       fillsRef,
       paletteIdxRef,
-      regionOrder,
-      palette,
       activeColor,
       pushUndoSnapshot,
       commit,
       getPrevPackedProgress,
+      packCtx,
     ],
   )
 

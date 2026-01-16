@@ -3,18 +3,28 @@
  * Progress packing utilities (Stage 3+)
  *
  * Goal:
- *  - Provide a compact, strictly validated representation of page progress:
+ *  - Compact, strictly validated representation of page progress:
  *      FillMap <-> Uint8Array <-> base64
- *  - This matches the future API contract (Stage 6.2):
+ *  - Future API contract alignment (Stage 6.2):
  *      Uint8Array length = regionsCount
  *      byte = palette index 0..paletteLen-1
  *      255 = UNPAINTED sentinel
  *
- * Design choices:
- *  - Does NOT assume any specific SVG format except stable region ids (e.g. R001).
- *  - Requires an explicit region order to avoid ambiguity:
- *      regionOrder[i] is the regionId mapped to progress byte i.
- *  - Strict bounds, caps, and defensive parsing (safe-by-default).
+ * Correctness invariants (critical):
+ *  - regionOrder and palette MUST be canonical and stable for a given contentHash.
+ *  - If SVG or palette changes in a way that affects ordering or palette membership,
+ *    you MUST change contentHash and store it as part of the snapshot key.
+ *    Otherwise, old progress bytes will map to the wrong regions/colors.
+ *
+ * Performance:
+ *  - compilePackContext(...) memoizes the heavy parts (normalized lists + index maps).
+ *  - packFillMapToBytesWithContext(...) is optimized for the hot path:
+ *      - avoids Object.entries allocation (uses for..in + hasOwnProperty)
+ *
+ * NOTE:
+ *  - We intentionally avoid `any` here to preserve type-safety and satisfy eslint
+ *    (`@typescript-eslint/no-explicit-any`). Runtime feature-detection is done via
+ *    narrowing `unknown` for Buffer availability.
  */
 
 export type RegionId = string
@@ -40,7 +50,7 @@ export type PackOptions = {
   maxPaletteLen?: number
 
   /**
-   * Maximum FillMap entries to process.
+   * Maximum FillMap entries to process (defense-in-depth).
    * Default: 10k.
    */
   maxFillEntries?: number
@@ -48,7 +58,7 @@ export type PackOptions = {
   /**
    * When true, unknown region ids in fills are ignored.
    * When false, pack throws on unknown regions.
-   * Default: true (more resilient to content updates).
+   * Default: true (resilient to minor content diffs).
    */
   ignoreUnknownRegions?: boolean
 
@@ -58,6 +68,30 @@ export type PackOptions = {
    * Default: true.
    */
   ignoreUnknownColors?: boolean
+
+  /**
+   * Input contract mode for regionOrder / palette.
+   *
+   * - strictInputs=true (default):
+   *   Does NOT reshape inputs. Validates:
+   *    - array type
+   *    - max length
+   *    - non-empty items
+   *    - uniqueness (unless allowDuplicate* is true)
+   *   This is recommended for production correctness.
+   *
+   * - strictInputs=false:
+   *   Trims, drops empty items, de-duplicates, and clamps to max caps.
+   *   Useful for migration/testing, but can hide content issues.
+   */
+  strictInputs?: boolean
+
+  /**
+   * Allow duplicate region ids / palette colors in strict mode.
+   * Default: false (duplicates are almost always a content bug).
+   */
+  allowDuplicateRegionIds?: boolean
+  allowDuplicatePaletteColors?: boolean
 }
 
 export type PackedProgress = {
@@ -70,6 +104,24 @@ export type DecodeResult =
   | { ok: true; bytes: Uint8Array }
   | { ok: false; reason: string }
 
+export type PackContext = {
+  regions: readonly string[]
+  palette: readonly string[]
+  regionIndex: ReadonlyMap<string, number>
+  colorIndex: ReadonlyMap<string, number>
+  regionsCount: number
+  paletteLen: number
+  opts: Required<PackOptions>
+}
+
+/**
+ * Non-throwing context compilation result (optional API).
+ * Use this if you want to avoid try/catch in higher layers.
+ */
+export type CompileContextResult =
+  | { ok: true; ctx: PackContext }
+  | { ok: false; reason: string }
+
 const UNPAINTED = 255
 
 const DEFAULTS: Required<PackOptions> = {
@@ -78,9 +130,16 @@ const DEFAULTS: Required<PackOptions> = {
   maxFillEntries: 10_000,
   ignoreUnknownRegions: true,
   ignoreUnknownColors: true,
+  strictInputs: true,
+  allowDuplicateRegionIds: false,
+  allowDuplicatePaletteColors: false,
 }
 
 /* --------------------------------- helpers -------------------------------- */
+
+function mergeOptions(opts?: PackOptions): Required<PackOptions> {
+  return { ...DEFAULTS, ...(opts ?? {}) }
+}
 
 function isNonEmptyString(v: unknown): v is string {
   return typeof v === "string" && v.trim().length > 0
@@ -98,48 +157,92 @@ function clampInt(n: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, x))
 }
 
-function mergeOptions(opts?: PackOptions): Required<PackOptions> {
-  return { ...DEFAULTS, ...(opts ?? {}) }
-}
+function normalizeStrictList(params: {
+  input: readonly unknown[]
+  maxLen: number
+  kind: "REGION" | "PALETTE"
+  allowDuplicates: boolean
+}): string[] {
+  const { input, maxLen, kind, allowDuplicates } = params
 
-function normalizePalette(
-  palette: readonly string[],
-  maxPaletteLen: number,
-): string[] {
-  const out: string[] = []
-  const seen = new Set<string>()
+  if (!Array.isArray(input)) throw new Error(`${kind}_INPUT_NOT_ARRAY`)
+  if (input.length > maxLen)
+    throw new Error(`${kind}_INPUT_TOO_LARGE:${input.length}>${maxLen}`)
 
-  const limit = Math.min(palette.length, maxPaletteLen)
-  for (let i = 0; i < limit; i++) {
-    const c = typeof palette[i] === "string" ? palette[i].trim() : ""
-    if (!c) continue
-    // Keep first occurrence. Palette order matters.
-    if (seen.has(c)) continue
-    seen.add(c)
-    out.push(c)
+  const out = new Array<string>(input.length)
+  const seen = allowDuplicates ? null : new Set<string>()
+
+  for (let i = 0; i < input.length; i++) {
+    const s = typeof input[i] === "string" ? input[i].trim() : ""
+    if (!s) throw new Error(`${kind}_EMPTY_ITEM_AT:${i}`)
+
+    if (seen) {
+      if (seen.has(s)) throw new Error(`${kind}_DUPLICATE_ITEM:${s}`)
+      seen.add(s)
+    }
+    out[i] = s
   }
+
   return out
 }
 
-function normalizeRegionOrder(
-  regionOrder: readonly string[],
-  maxRegions: number,
-): string[] {
+function normalizeCoerceList(params: {
+  input: readonly unknown[]
+  maxLen: number
+}): string[] {
+  const { input, maxLen } = params
+  if (!Array.isArray(input) || input.length === 0) return []
+
   const out: string[] = []
   const seen = new Set<string>()
+  const limit = Math.min(input.length, maxLen)
 
-  const limit = Math.min(regionOrder.length, maxRegions)
   for (let i = 0; i < limit; i++) {
-    const id = typeof regionOrder[i] === "string" ? regionOrder[i].trim() : ""
-    if (!id) continue
-    if (seen.has(id)) continue
-    seen.add(id)
-    out.push(id)
+    const s = typeof input[i] === "string" ? input[i].trim() : ""
+    if (!s) continue
+    if (seen.has(s)) continue
+    seen.add(s)
+    out.push(s)
   }
+
   return out
+}
+
+function buildIndexMap(keys: readonly string[]): Map<string, number> {
+  const m = new Map<string, number>()
+  for (let i = 0; i < keys.length; i++) m.set(keys[i], i)
+  return m
+}
+
+/**
+ * Base64 encode/decode for raw bytes:
+ * - Browser: btoa/atob
+ * - Node-like runtimes: Buffer fallback (tests/tooling/SSR)
+ */
+
+type BufferLike = Uint8Array & { toString(encoding: "base64"): string }
+type BufferCtorLike = {
+  from(data: Uint8Array): BufferLike
+  from(data: string, encoding: "base64"): Uint8Array
+}
+
+function getBufferCtor(): BufferCtorLike | null {
+  const g = globalThis as unknown as { Buffer?: unknown }
+  const B = g.Buffer
+
+  // Node's Buffer is a callable with a static .from(...)
+  if (!B || typeof B !== "function") return null
+
+  const from = (B as { from?: unknown }).from
+  if (typeof from !== "function") return null
+
+  return B as unknown as BufferCtorLike
 }
 
 function bytesToBase64(bytes: Uint8Array): string {
+  const BufferCtor = getBufferCtor()
+  if (BufferCtor) return BufferCtor.from(bytes).toString("base64")
+
   let bin = ""
   const CHUNK = 0x8000
   for (let i = 0; i < bytes.length; i += CHUNK) {
@@ -152,6 +255,17 @@ function bytesToBase64(bytes: Uint8Array): string {
 function base64ToBytes(b64: string): Uint8Array | null {
   const s = typeof b64 === "string" ? b64.trim() : ""
   if (!s) return null
+
+  const BufferCtor = getBufferCtor()
+  if (BufferCtor) {
+    try {
+      const u8 = BufferCtor.from(s, "base64")
+      return new Uint8Array(u8.buffer, u8.byteOffset, u8.byteLength)
+    } catch {
+      return null
+    }
+  }
+
   try {
     const bin = atob(s)
     const out = new Uint8Array(bin.length)
@@ -162,13 +276,99 @@ function base64ToBytes(b64: string): Uint8Array | null {
   }
 }
 
-function buildIndexMap(keys: readonly string[]): Map<string, number> {
-  const m = new Map<string, number>()
-  for (let i = 0; i < keys.length; i++) m.set(keys[i], i)
-  return m
+function normalizeRegionOrder(
+  regionOrder: readonly string[],
+  opts: Required<PackOptions>,
+): string[] {
+  if (opts.strictInputs) {
+    return normalizeStrictList({
+      input: regionOrder as unknown as readonly unknown[],
+      maxLen: opts.maxRegions,
+      kind: "REGION",
+      allowDuplicates: opts.allowDuplicateRegionIds,
+    })
+  }
+  return normalizeCoerceList({
+    input: regionOrder as unknown as readonly unknown[],
+    maxLen: opts.maxRegions,
+  })
+}
+
+function normalizePalette(
+  palette: readonly string[],
+  opts: Required<PackOptions>,
+): string[] {
+  if (opts.strictInputs) {
+    return normalizeStrictList({
+      input: palette as unknown as readonly unknown[],
+      maxLen: opts.maxPaletteLen,
+      kind: "PALETTE",
+      allowDuplicates: opts.allowDuplicatePaletteColors,
+    })
+  }
+  return normalizeCoerceList({
+    input: palette as unknown as readonly unknown[],
+    maxLen: opts.maxPaletteLen,
+  })
 }
 
 /* ---------------------------------- API ---------------------------------- */
+
+export const PROGRESS_UNPAINTED = UNPAINTED
+
+/**
+ * Compile canonical pack inputs into a reusable context.
+ *
+ * Throws on contract violations in strict mode.
+ * If you prefer non-throwing behavior, use tryCompilePackContext(...).
+ */
+export function compilePackContext(
+  regionOrder: readonly string[],
+  palette: readonly string[],
+  opts?: PackOptions,
+): PackContext {
+  const o = mergeOptions(opts)
+  const regions = normalizeRegionOrder(regionOrder, o)
+  const pal = normalizePalette(palette, o)
+
+  if (o.strictInputs) {
+    if (regions.length <= 0) throw new Error("REGION_EMPTY")
+    if (pal.length <= 0) throw new Error("PALETTE_EMPTY")
+  }
+
+  const regionIndex = buildIndexMap(regions)
+  const colorIndex = buildIndexMap(pal)
+
+  return {
+    regions,
+    palette: pal,
+    regionIndex,
+    colorIndex,
+    regionsCount: regions.length,
+    paletteLen: pal.length,
+    opts: o,
+  }
+}
+
+/**
+ * Non-throwing alternative to compilePackContext(...).
+ * Useful if you want to avoid try/catch in callers.
+ */
+export function tryCompilePackContext(
+  regionOrder: readonly string[],
+  palette: readonly string[],
+  opts?: PackOptions,
+): CompileContextResult {
+  try {
+    return { ok: true, ctx: compilePackContext(regionOrder, palette, opts) }
+  } catch (e: unknown) {
+    const msg =
+      e instanceof Error && typeof e.message === "string"
+        ? e.message
+        : "CTX_ERR"
+    return { ok: false, reason: msg }
+  }
+}
 
 /**
  * Create empty progress bytes (all UNPAINTED).
@@ -179,58 +379,51 @@ export function makeEmptyProgressBytes(
 ): Uint8Array {
   const o = mergeOptions(opts)
   const rc = clampInt(regionsCount, 0, o.maxRegions)
-
   const bytes = new Uint8Array(rc)
   bytes.fill(UNPAINTED)
   return bytes
 }
 
 /**
- * Pack FillMap into bytes using:
- *  - regionOrder: defines index mapping
- *  - palette: defines color->index mapping
+ * Pack FillMap into bytes using a compiled context (fast path).
  *
- * Unknown regions/colors can be ignored (default) or rejected.
+ * Hot-path optimizations:
+ * - avoids Object.entries(...) allocation
+ * - uses for..in + hasOwnProperty
+ * - respects maxFillEntries (defense-in-depth)
  */
-export function packFillMapToBytes(
+export function packFillMapToBytesWithContext(
   fills: FillMap,
-  regionOrder: readonly string[],
-  palette: readonly string[],
-  opts?: PackOptions,
+  ctx: PackContext,
 ): Uint8Array {
-  const o = mergeOptions(opts)
-
-  const regions = normalizeRegionOrder(regionOrder, o.maxRegions)
-  const pal = normalizePalette(palette, o.maxPaletteLen)
-
-  const regionIndex = buildIndexMap(regions)
-  const colorIndex = buildIndexMap(pal)
-
-  const bytes = new Uint8Array(regions.length)
+  const bytes = new Uint8Array(ctx.regionsCount)
   bytes.fill(UNPAINTED)
 
   if (!fills || typeof fills !== "object") return bytes
 
-  const entries = Object.entries(fills as Record<string, unknown>)
-  const limit = Math.min(entries.length, o.maxFillEntries)
+  const fillRecord = fills as Record<string, unknown>
 
-  for (let i = 0; i < limit; i++) {
-    const [ridRaw, colorRaw] = entries[i]
+  let processed = 0
+  for (const ridRaw in fillRecord) {
+    if (!Object.prototype.hasOwnProperty.call(fillRecord, ridRaw)) continue
+    if (processed >= ctx.opts.maxFillEntries) break
+    processed++
 
     const rid = typeof ridRaw === "string" ? ridRaw.trim() : ""
+    const colorRaw = fillRecord[ridRaw]
     const color = typeof colorRaw === "string" ? colorRaw.trim() : ""
 
     if (!rid || !color) continue
 
-    const rIdx = regionIndex.get(rid)
+    const rIdx = ctx.regionIndex.get(rid)
     if (rIdx === undefined) {
-      if (o.ignoreUnknownRegions) continue
+      if (ctx.opts.ignoreUnknownRegions) continue
       throw new Error(`PACK_UNKNOWN_REGION:${rid}`)
     }
 
-    const cIdx = colorIndex.get(color)
+    const cIdx = ctx.colorIndex.get(color)
     if (cIdx === undefined) {
-      if (o.ignoreUnknownColors) continue
+      if (ctx.opts.ignoreUnknownColors) continue
       throw new Error(`PACK_UNKNOWN_COLOR:${color}`)
     }
 
@@ -241,15 +434,46 @@ export function packFillMapToBytes(
 }
 
 /**
- * Unpack bytes into FillMap using:
- *  - regionOrder: defines index mapping
- *  - palette: defines index->color mapping
- *
- * Values:
- *  - 255 => unpainted (skipped)
- *  - 0..paletteLen-1 => palette index
- *
- * Invalid values are treated as unpainted.
+ * Pack FillMap into bytes (compat path).
+ * NOTE: Compiles context each call; prefer compilePackContext + fast path for frequent calls.
+ */
+export function packFillMapToBytes(
+  fills: FillMap,
+  regionOrder: readonly string[],
+  palette: readonly string[],
+  opts?: PackOptions,
+): Uint8Array {
+  const ctx = compilePackContext(regionOrder, palette, opts)
+  return packFillMapToBytesWithContext(fills, ctx)
+}
+
+/**
+ * Unpack bytes into FillMap using a compiled context (fast path).
+ */
+export function unpackBytesToFillMapWithContext(
+  bytes: Uint8Array,
+  ctx: PackContext,
+): FillMap {
+  const out: FillMap = {}
+  const n = Math.min(bytes.length, ctx.regionsCount)
+
+  for (let i = 0; i < n; i++) {
+    const v = bytes[i]
+    if (v === UNPAINTED) continue
+    if (v >= ctx.paletteLen) continue
+
+    const rid = ctx.regions[i]
+    const color = ctx.palette[v]
+    if (!rid || !color) continue
+
+    out[rid] = color
+  }
+
+  return out
+}
+
+/**
+ * Unpack bytes into FillMap (compat path).
  */
 export function unpackBytesToFillMap(
   bytes: Uint8Array,
@@ -257,27 +481,8 @@ export function unpackBytesToFillMap(
   palette: readonly string[],
   opts?: PackOptions,
 ): FillMap {
-  const o = mergeOptions(opts)
-
-  const regions = normalizeRegionOrder(regionOrder, o.maxRegions)
-  const pal = normalizePalette(palette, o.maxPaletteLen)
-
-  const out: FillMap = {}
-  const n = Math.min(bytes.length, regions.length)
-
-  for (let i = 0; i < n; i++) {
-    const v = bytes[i]
-    if (v === UNPAINTED) continue
-    if (v >= pal.length) continue
-
-    const rid = regions[i]
-    const color = pal[v]
-    if (!rid || !color) continue
-
-    out[rid] = color
-  }
-
-  return out
+  const ctx = compilePackContext(regionOrder, palette, opts)
+  return unpackBytesToFillMapWithContext(bytes, ctx)
 }
 
 /**
@@ -289,6 +494,10 @@ export function encodeBytesToBase64(bytes: Uint8Array): string {
 
 /**
  * Decode base64 to bytes and validate shape + ranges.
+ *
+ * IMPORTANT:
+ * - Empty string is considered invalid (B64_EMPTY). If you need "blank page",
+ *   store a real packed base64 created from makeEmptyProgressBytes(regionsCount).
  */
 export function decodeBase64ToBytes(
   progressB64: string,
@@ -297,7 +506,6 @@ export function decodeBase64ToBytes(
   opts?: PackOptions,
 ): DecodeResult {
   const o = mergeOptions(opts)
-
   const rc = clampInt(regionsCount, 0, o.maxRegions)
   const pl = clampInt(paletteLen, 0, o.maxPaletteLen)
 
@@ -307,7 +515,6 @@ export function decodeBase64ToBytes(
   if (!bytes) return { ok: false, reason: "B64_DECODE_FAILED" }
   if (bytes.length !== rc) return { ok: false, reason: "B64_LENGTH_MISMATCH" }
 
-  // Strict validation
   for (let i = 0; i < bytes.length; i++) {
     const v = bytes[i]
     if (v === UNPAINTED) continue
@@ -326,14 +533,12 @@ export function packFillMapToPackedProgress(
   palette: readonly string[],
   opts?: PackOptions,
 ): PackedProgress {
-  const o = mergeOptions(opts)
-  const regions = normalizeRegionOrder(regionOrder, o.maxRegions)
-  const pal = normalizePalette(palette, o.maxPaletteLen)
+  const ctx = compilePackContext(regionOrder, palette, opts)
+  const bytes = packFillMapToBytesWithContext(fills, ctx)
 
-  const bytes = packFillMapToBytes(fills, regions, pal, o)
   return {
-    regionsCount: regions.length,
-    paletteLen: pal.length,
+    regionsCount: ctx.regionsCount,
+    paletteLen: ctx.paletteLen,
     progressB64: bytesToBase64(bytes),
   }
 }
@@ -348,31 +553,27 @@ export function unpackPackedProgressToFillMap(
   palette: readonly string[],
   opts?: PackOptions,
 ): FillMap {
-  const o = mergeOptions(opts)
-
-  const regions = normalizeRegionOrder(regionOrder, o.maxRegions)
-  const pal = normalizePalette(palette, o.maxPaletteLen)
+  const ctx = compilePackContext(regionOrder, palette, opts)
 
   const rc = isFiniteNonNegativeInt(packed.regionsCount)
     ? packed.regionsCount
-    : regions.length
+    : ctx.regionsCount
   const pl = isFiniteNonNegativeInt(packed.paletteLen)
     ? packed.paletteLen
-    : pal.length
+    : ctx.paletteLen
 
-  const res = decodeBase64ToBytes(packed.progressB64, rc, pl, o)
+  const res = decodeBase64ToBytes(packed.progressB64, rc, pl, ctx.opts)
   if (!res.ok) return {}
 
-  return unpackBytesToFillMap(res.bytes, regions, pal, o)
+  // Prevent applying mismatched progress to a different region order.
+  if (res.bytes.length !== ctx.regionsCount) return {}
+
+  return unpackBytesToFillMapWithContext(res.bytes, ctx)
 }
 
 /**
- * Back-compat export for App.tsx (older integration):
+ * Back-compat export for App.tsx:
  * decode packed progress (base64 bytes) directly into FillMap.
- *
- * This assumes:
- * - regionOrder is the canonical order used to pack the bytes
- * - palette is the canonical palette used to map indices -> CSS colors
  */
 export function decodeProgressB64ToFillMap(args: {
   progressB64: string
@@ -382,19 +583,17 @@ export function decodeProgressB64ToFillMap(args: {
   palette: readonly string[]
   opts?: PackOptions
 }): FillMap {
+  const ctx = compilePackContext(args.regionOrder, args.palette, args.opts)
   const res = decodeBase64ToBytes(
     args.progressB64,
     args.regionsCount,
     args.paletteLen,
-    args.opts,
+    ctx.opts,
   )
   if (!res.ok) return {}
-  return unpackBytesToFillMap(
-    res.bytes,
-    args.regionOrder,
-    args.palette,
-    args.opts,
-  )
-}
 
-export const PROGRESS_UNPAINTED = UNPAINTED
+  // Mismatch => treat as invalid snapshot (prevents shifted progress).
+  if (res.bytes.length !== ctx.regionsCount) return {}
+
+  return unpackBytesToFillMapWithContext(res.bytes, ctx)
+}

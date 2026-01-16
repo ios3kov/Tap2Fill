@@ -33,6 +33,60 @@ export type UndoHistory = {
   }
 }
 
+/**
+ * Defense-in-depth: prevent pathological memory usage if something injects
+ * an unexpectedly large "progressB64" string into the undo stack.
+ *
+ * Keep aligned with snapshot.ts / storage caps.
+ */
+const MAX_B64_LEN = 200_000
+
+function clampUsed(used: unknown): number {
+  return clampNonNegativeInt(used, 0)
+}
+
+/**
+ * Budget semantics:
+ * - budgetPerSession <= 0  => unlimited undo (Infinity)
+ * - budgetPerSession > 0   => limited undo (budget - used)
+ */
+function computeUndoLeft(budgetPerSession: number, used: number): number {
+  const budgetRaw = Number.isFinite(budgetPerSession)
+    ? Math.trunc(budgetPerSession)
+    : 0
+  if (budgetRaw <= 0) return Number.POSITIVE_INFINITY
+
+  const budget = clampNonNegativeInt(budgetRaw, 0)
+  const u = clampUsed(used)
+  return Math.max(0, budget - u)
+}
+
+function canUndoNow(stackLen: number, undoLeft: number): boolean {
+  return stackLen > 0 && undoLeft > 0
+}
+
+function sanitizeSnapshotItem(v: unknown): string | null {
+  // IMPORTANT: empty string is valid ("blank page")
+  const s = String(v ?? "")
+  if (s.length > MAX_B64_LEN) return null
+  return s
+}
+
+function sanitizeStack(stack: unknown): string[] {
+  if (!Array.isArray(stack)) return []
+
+  const out: string[] = []
+  const limit = Math.min(stack.length, APP_CONFIG.limits.undoStackMax)
+
+  for (let i = 0; i < limit; i++) {
+    const item = sanitizeSnapshotItem(stack[i])
+    if (item === null) continue
+    out.push(item)
+  }
+
+  return out
+}
+
 export function useUndoHistory(params: {
   budgetPerSession: number
 }): UndoHistory {
@@ -42,82 +96,79 @@ export function useUndoHistory(params: {
   const undoStackRef = useRef<string[]>([])
   const undoUsedRef = useRef(0)
 
-  const syncRefs = useCallback((stack: string[], used: number) => {
-    undoStackRef.current = stack
-    undoUsedRef.current = used
+  /**
+   * Single write-path: keep React state + refs consistent.
+   *
+   * React setState is async, but hot-path callers read from refs.
+   * We update refs synchronously alongside state transitions.
+   */
+  const apply = useCallback((nextStack: string[], nextUsed: number) => {
+    setUndoStackB64(nextStack)
+    setUndoBudgetUsed(nextUsed)
+    undoStackRef.current = nextStack
+    undoUsedRef.current = nextUsed
   }, [])
 
   const setFromRestore = useCallback(
     (stack: string[], used: number) => {
-      const safeStack = (stack ?? [])
-        .slice(0, APP_CONFIG.limits.undoStackMax)
-        .map((s) => String(s ?? "")) // IMPORTANT: keep empty string as valid snapshot
-      const safeUsed = clampNonNegativeInt(used, 0)
-
-      setUndoStackB64(safeStack)
-      setUndoBudgetUsed(safeUsed)
-      syncRefs(safeStack, safeUsed)
+      const safeStack = sanitizeStack(stack)
+      const safeUsed = clampUsed(used)
+      apply(safeStack, safeUsed)
     },
-    [syncRefs],
+    [apply],
   )
 
   const pushSnapshot = useCallback(
     (prevPackedProgressB64: string) => {
       const prev = undoStackRef.current
-      const item = String(prevPackedProgressB64 ?? "") // keep empty snapshot valid
 
-      // Avoid pushing duplicates (common when progress isn't changing).
+      const item = sanitizeSnapshotItem(prevPackedProgressB64)
+      if (item === null) return
+
       const last = prev.length > 0 ? String(prev[prev.length - 1] ?? "") : null
       if (last !== null && last === item) return
 
-      const next = [...prev, item].slice(-APP_CONFIG.limits.undoStackMax)
-      setUndoStackB64(next)
-      syncRefs(next, undoUsedRef.current)
+      const nextStack = [...prev, item].slice(-APP_CONFIG.limits.undoStackMax)
+      apply(nextStack, undoUsedRef.current)
     },
-    [syncRefs],
+    [apply],
   )
 
   const undoLeft = useMemo(() => {
-    const used = clampNonNegativeInt(undoBudgetUsed, 0)
-    return Math.max(0, params.budgetPerSession - used)
+    return computeUndoLeft(params.budgetPerSession, undoBudgetUsed)
   }, [params.budgetPerSession, undoBudgetUsed])
 
-  const canUndo = useMemo(
-    () => undoLeft > 0 && undoStackB64.length > 0,
-    [undoLeft, undoStackB64.length],
-  )
+  const canUndo = useMemo(() => {
+    return canUndoNow(undoStackB64.length, undoLeft)
+  }, [undoLeft, undoStackB64.length])
 
   const popSnapshotBudgeted = useCallback(() => {
     const stack = undoStackRef.current
     if (stack.length <= 0) return null
 
-    const used = clampNonNegativeInt(undoUsedRef.current, 0)
-    const left = Math.max(0, params.budgetPerSession - used)
+    const used = clampUsed(undoUsedRef.current)
+    const left = computeUndoLeft(params.budgetPerSession, used)
     if (left <= 0) return null
 
-    const packedB64 = String(stack[stack.length - 1] ?? "") // may be empty: valid "blank page"
+    const packedB64 = String(stack[stack.length - 1] ?? "")
     const nextStack = stack.slice(0, -1)
+
+    // We still increment "used" even in unlimited mode: useful for analytics/debug,
+    // and keeps persisted snapshots consistent.
     const nextUsed = used + 1
 
-    // ATOMIC APPLY: update state+refs here.
-    setUndoStackB64(nextStack)
-    setUndoBudgetUsed(nextUsed)
-    syncRefs(nextStack, nextUsed)
-
+    apply(nextStack, nextUsed)
     return { packedB64, nextStack, nextUsed }
-  }, [params.budgetPerSession, syncRefs])
+  }, [params.budgetPerSession, apply])
 
   const resetKeepBudget = useCallback(() => {
-    const used = undoUsedRef.current
-    setUndoStackB64([])
-    syncRefs([], used)
-  }, [syncRefs])
+    const used = clampUsed(undoUsedRef.current)
+    apply([], used)
+  }, [apply])
 
   const resetAll = useCallback(() => {
-    setUndoStackB64([])
-    setUndoBudgetUsed(0)
-    syncRefs([], 0)
-  }, [syncRefs])
+    apply([], 0)
+  }, [apply])
 
   return {
     undoStackB64,
