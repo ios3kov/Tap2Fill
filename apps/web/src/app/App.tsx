@@ -588,7 +588,11 @@ export default function App() {
   }
 
   // ===== Tap-to-fill handler (blocked during gesture) =====
-  async function onPointerDown(e: React.PointerEvent) {
+  async function onPointerUp(e: React.PointerEvent) {
+    // Prevent iOS double-tap zoom / delayed click synthesis
+    e.preventDefault()
+    e.stopPropagation()
+
     const isTouch = e.pointerType === "touch"
 
     // Never fill while zoom/pan is actively gesturing.
@@ -976,7 +980,7 @@ export default function App() {
             onPointerDownCapture={onCanvasPointerDownCapture}
             onPointerUpCapture={onCanvasPointerUpCapture}
             onPointerCancelCapture={onCanvasPointerCancelCapture}
-            onPointerDown={onPointerDown}
+            onPointerUp={onPointerUp}
             style={{ marginTop: 12, height: 520 }}
             aria-label="Coloring canvas"
           >
