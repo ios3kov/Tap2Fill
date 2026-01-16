@@ -1,0 +1,15 @@
+<!-- apps/web/src/app/demoPage.svg -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 360">
+  <!-- regions (clickable) -->
+  <path data-region="R001" d="M30 40 H170 V170 H30 Z" fill="#ffffff"/>
+  <path data-region="R002" d="M190 40 H330 V170 H190 Z" fill="#ffffff"/>
+  <path data-region="R003" d="M30 190 H330 V330 H30 Z" fill="#ffffff"/>
+
+  <!-- outline/decor (NOT clickable) -->
+  <g data-role="outline" fill="none" stroke="#111827" stroke-width="6" vector-effect="non-scaling-stroke">
+    <rect x="30" y="40" width="140" height="130" rx="16"/>
+    <rect x="190" y="40" width="140" height="130" rx="16"/>
+    <rect x="30" y="190" width="300" height="140" rx="18"/>
+    <path d="M180 20V340" opacity="0.15"/>
+  </g>
+</svg>

@@ -1,3 +1,4 @@
+// apps/web/src/app/App.tsx
 import { useEffect, useMemo, useRef, useState } from "react";
 import { getInitData, isTma, tmaBootstrap } from "../lib/tma";
 import { getMeState, putMeState, type MeState, hasTelegramInitData } from "../lib/api";
@@ -11,6 +12,10 @@ import {
 } from "../local/snapshot";
 import { clearPendingMeState, enqueueMeState, loadPendingMeState } from "../local/outbox";
 
+import demoSvg from "./demoPage.svg?raw";
+import { hitTestRegion } from "./hitTest";
+import { DEFAULT_PALETTE, applyFillsToContainer, safeColorIndex, type FillMap } from "./coloring";
+
 const DEMO_PAGE_ID = "page_demo_1";
 const DEMO_CONTENT_HASH = "demo_hash_v1";
 
@@ -22,11 +27,12 @@ function safeJson(x: unknown): string {
   }
 }
 
+
 export default function App() {
   const [out, setOut] = useState("idle");
   const [tick, setTick] = useState(0);
 
-  // Local-first state
+  // Local-first state (existing)
   const [clientRev, setClientRev] = useState(0);
   const [demoCounter, setDemoCounter] = useState(0);
   const [lastPageId, setLastPageId] = useState<string | null>(null);
@@ -34,11 +40,21 @@ export default function App() {
   // Visibility: server
   const [serverState, setServerState] = useState<MeState | null>(null);
 
+  // Stage 2: coloring UI state (kept local for now)
+  const [paletteIdx, setPaletteIdx] = useState(0);
+  const [fills, setFills] = useState<FillMap>({});
+  const [lastTap, setLastTap] = useState<string>("none");
+
+  const svgHostRef = useRef<HTMLDivElement | null>(null);
+
   useEffect(() => {
-    tmaBootstrap();
+    const cleanup = tmaBootstrap();
     const id = window.setInterval(() => setTick((t) => t + 1), 250);
     window.setTimeout(() => window.clearInterval(id), 3000);
-    return () => window.clearInterval(id);
+    return () => {
+      window.clearInterval(id);
+      cleanup?.();
+    };
   }, []);
 
   const initDataLen = useMemo(() => getInitData().length, [tick]);
@@ -75,7 +91,7 @@ export default function App() {
       if (!canCallServer) return;
 
       try {
-        const res = await getMeState(); // returns normalized MeState|null
+        const res = await getMeState();
         if (cancelled) return;
 
         setServerState(res.state);
@@ -83,17 +99,17 @@ export default function App() {
         const st = res.state;
         if (!st) return;
 
+        // Only if server is strictly ahead
         if (st.clientRev > clientRev) {
           setClientRev(st.clientRev);
           setLastPageId(st.lastPageId);
 
-          // We keep demoCounter local; snapshot exists to track rev + restore.
           const snap: PageSnapshotV1 = {
             schemaVersion: 1,
             pageId: DEMO_PAGE_ID,
             contentHash: DEMO_CONTENT_HASH,
             clientRev: st.clientRev,
-            demoCounter,
+            demoCounter, // kept local in this stage
             updatedAtMs: Date.now(),
           };
           await savePageSnapshot(snap);
@@ -160,6 +176,56 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [canCallServer]);
 
+  // ===== Stage 2: SVG mount + apply fills =====
+  useEffect(() => {
+    const host = svgHostRef.current;
+    if (!host) return;
+
+    host.innerHTML = demoSvg;
+
+    const svg = host.querySelector("svg");
+    if (!svg) {
+      setOut((prev) => (prev === "idle" ? "WARN: SVG not mounted" : prev));
+      return;
+    }
+
+    // Mark root for CSS policies
+    svg.setAttribute("data-page-root", "1");
+
+    // Apply current fills
+    applyFillsToContainer(host, fills);
+  }, [fills]);
+
+  function activeColor(): string {
+    return DEFAULT_PALETTE[safeColorIndex(paletteIdx)];
+  }
+
+  // Local-first action (existing): snapshot immediately + enqueue server write + schedule batched push
+  async function simulateLocalAction() {
+    const nextRev = clientRev + 1;
+    const nextCounter = demoCounter + 1;
+
+    setClientRev(nextRev);
+    setDemoCounter(nextCounter);
+
+    const snap: PageSnapshotV1 = {
+      schemaVersion: 1,
+      pageId: DEMO_PAGE_ID,
+      contentHash: DEMO_CONTENT_HASH,
+      clientRev: nextRev,
+      demoCounter: nextCounter,
+      updatedAtMs: Date.now(),
+    };
+    await savePageSnapshot(snap);
+
+    const newLast = DEMO_PAGE_ID;
+    setLastPageId(newLast);
+    await saveLastPageId(newLast);
+
+    await enqueueMeState(newLast, nextRev);
+    await scheduleFlush(600);
+  }
+
   async function runSmokePutState() {
     setOut("calling...");
     try {
@@ -187,30 +253,37 @@ export default function App() {
     }
   }
 
-  // Local-first action: snapshot immediately + enqueue server write + schedule batched push
-  async function simulateLocalAction() {
-    const nextRev = clientRev + 1;
-    const nextCounter = demoCounter + 1;
+  // ===== Stage 2: tap-to-fill handler =====
+  async function onPointerDown(e: React.PointerEvent) {
+    if (e.button !== 0) return;
 
-    setClientRev(nextRev);
-    setDemoCounter(nextCounter);
+    const host = svgHostRef.current;
+    if (!host) return;
 
-    const snap: PageSnapshotV1 = {
-      schemaVersion: 1,
-      pageId: DEMO_PAGE_ID,
-      contentHash: DEMO_CONTENT_HASH,
-      clientRev: nextRev,
-      demoCounter: nextCounter,
-      updatedAtMs: Date.now(),
-    };
-    await savePageSnapshot(snap);
+    const hit = hitTestRegion(e.clientX, e.clientY);
+    if (!hit) {
+      setLastTap("tap: no region");
+      return;
+    }
 
-    const newLast = DEMO_PAGE_ID;
-    setLastPageId(newLast);
-    await saveLastPageId(newLast);
+    const color = activeColor();
 
-    await enqueueMeState(newLast, nextRev);
-    await scheduleFlush(600);
+    // Apply to DOM immediately (responsiveness)
+    const el = host.querySelector(`[data-region="${CSS.escape(hit.regionId)}"]`);
+    if (el) el.setAttribute("fill", color);
+
+    // Commit local fill state
+    setFills((prev) => {
+      if (prev[hit.regionId] === color) return prev;
+      return { ...prev, [hit.regionId]: color };
+    });
+
+    setLastTap(`filled ${hit.regionId} -> ${color}`);
+
+    // Treat a fill as a local-first action that advances rev.
+    // For Stage 2 we link coloring interaction to the same local-first pipeline:
+    // snapshot + enqueue server me/state (cross-device restore).
+    await simulateLocalAction();
   }
 
   async function resetLocal() {
@@ -222,15 +295,34 @@ export default function App() {
     setDemoCounter(0);
     setLastPageId(null);
     setServerState(null);
+    setFills({});
+    setLastTap("none");
     setOut("idle");
   }
 
-  return (
-    <div style={{ padding: 16, fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial" }}>
-      <h1 style={{ margin: 0 }}>Tap2Fill</h1>
-      <p style={{ opacity: 0.7, marginTop: 6 }}>Local-first + server restore + batched sync</p>
+  const canDebugServer = canCallServer;
 
-      <div style={{ border: "1px solid rgba(127,127,127,0.25)", borderRadius: 14, padding: 14 }}>
+  return (
+    <div
+      style={{
+        minHeight: "var(--tg-vh, 100dvh)",
+        padding:
+          "max(env(safe-area-inset-top), 12px) max(env(safe-area-inset-right), 12px) max(env(safe-area-inset-bottom), 12px) max(env(safe-area-inset-left), 12px)",
+        fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial",
+      }}
+    >
+      <h1 style={{ margin: 0 }}>Tap2Fill</h1>
+      <p style={{ opacity: 0.7, marginTop: 6 }}>Local-first + server restore + batched sync + tap-to-fill</p>
+
+      {/* Stage 2: Coloring surface */}
+      <div
+        style={{
+          marginTop: 12,
+          border: "1px solid rgba(127,127,127,0.25)",
+          borderRadius: 14,
+          padding: 14,
+        }}
+      >
         <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
           <span>Runtime</span>
           <strong>{runtimeLabel}</strong>
@@ -241,6 +333,68 @@ export default function App() {
           <strong>{initDataLen}</strong>
         </div>
 
+        <div style={{ marginTop: 12, display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+          {DEFAULT_PALETTE.map((c, idx) => {
+            const active = idx === safeColorIndex(paletteIdx);
+            return (
+              <button
+                key={c}
+                onClick={() => setPaletteIdx(idx)}
+                style={{
+                  width: 32,
+                  height: 32,
+                  borderRadius: 10,
+                  border: active ? "2px solid rgba(127,127,127,0.85)" : "1px solid rgba(127,127,127,0.25)",
+                  background: c,
+                }}
+                aria-label={`color ${c}`}
+              />
+            );
+          })}
+          <span style={{ marginLeft: "auto", opacity: 0.75, fontSize: 13 }}>
+            Active: <strong>{activeColor()}</strong>
+          </span>
+        </div>
+
+        <div
+          onPointerDown={onPointerDown}
+          style={{
+            marginTop: 12,
+            borderRadius: 14,
+            border: "1px solid rgba(127,127,127,0.25)",
+            background: "rgba(127,127,127,0.06)",
+            padding: 10,
+            touchAction: "manipulation",
+          }}
+        >
+          <div
+            ref={svgHostRef}
+            style={{
+              width: "100%",
+              maxWidth: 520,
+              margin: "0 auto",
+              aspectRatio: "1 / 1",
+              display: "grid",
+              placeItems: "center",
+            }}
+          />
+
+          {/* Hit-test hardening policy */}
+          <style>{`
+            [data-page-root] { width: 100%; height: auto; display: block; }
+            [data-page-root] { pointer-events: none; }
+            [data-page-root] [data-region] { pointer-events: all; }
+            [data-page-root] [data-role="outline"] { pointer-events: none; }
+          `}</style>
+        </div>
+
+        <div style={{ marginTop: 10, fontSize: 13, opacity: 0.85 }}>
+          Last tap: <strong>{lastTap}</strong> · Filled: <strong>{Object.keys(fills).length}</strong>
+        </div>
+      </div>
+
+      {/* Existing debug panel (kept) */}
+      <div style={{ marginTop: 12, border: "1px solid rgba(127,127,127,0.25)", borderRadius: 14, padding: 14 }}>
         <div style={{ marginTop: 12, padding: 12, borderRadius: 12, background: "rgba(127,127,127,0.08)" }}>
           <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
             <span>Local lastPageId</span>
@@ -284,7 +438,7 @@ export default function App() {
 
         <button
           onClick={testIdempotencySameClientRev}
-          disabled={!canCallServer}
+          disabled={!canDebugServer}
           style={{
             marginTop: 10,
             width: "100%",
@@ -293,7 +447,7 @@ export default function App() {
             border: "1px solid rgba(127,127,127,0.35)",
             background: "transparent",
             fontWeight: 650,
-            opacity: !canCallServer ? 0.5 : 0.9,
+            opacity: !canDebugServer ? 0.5 : 0.9,
           }}
         >
           Test Idempotency (same clientRev)
@@ -301,7 +455,7 @@ export default function App() {
 
         <button
           onClick={runSmokePutState}
-          disabled={!canCallServer}
+          disabled={!canDebugServer}
           style={{
             marginTop: 10,
             width: "100%",
@@ -310,7 +464,7 @@ export default function App() {
             border: "1px solid rgba(127,127,127,0.35)",
             background: "transparent",
             fontWeight: 650,
-            opacity: !canCallServer ? 0.5 : 1,
+            opacity: !canDebugServer ? 0.5 : 1,
           }}
         >
           Run Smoke Test (PUT /v1/me/state)
@@ -335,6 +489,11 @@ export default function App() {
         <pre style={{ marginTop: 12, padding: 10, borderRadius: 12, background: "rgba(127,127,127,0.10)" }}>
           {out}
         </pre>
+      </div>
+
+      <div style={{ marginTop: 10, fontSize: 12, opacity: 0.65 }}>
+        Note: Stage 2 links each fill to the existing local-first pipeline by advancing clientRev and syncing /v1/me/state.
+        Region-level progress persistence will be introduced in the next step (progress API + page snapshot payload).
       </div>
     </div>
   );
