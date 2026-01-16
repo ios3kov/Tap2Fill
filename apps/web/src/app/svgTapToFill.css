@@ -1,0 +1,155 @@
+/* apps/web/src/app/svgTapToFill.css
+ *
+ * Stage 2 — SVG Tap-to-Fill pointer policy + minimal UI primitives.
+ *
+ * Contract:
+ * - Root SVG marked by svgTapToFill.ts with: data-page-root="1" (configurable, but default is data-page-root)
+ * - Clickable regions: [data-region="R###"]
+ * - Non-interactive decoration/outline: [data-role="outline"]
+ *
+ * Hit-test hardening policy:
+ * - Root SVG: pointer-events: none
+ * - Regions: pointer-events: all
+ * - Outline: pointer-events: none
+ */
+
+/* ===== Pointer-events hardening (core) ===== */
+
+[data-page-root] {
+  display: block;
+  width: 100%;
+  height: auto;
+
+  /* Hardening: prevent accidental selection/drags and ensure hit-testing only via regions */
+  pointer-events: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+
+  /* Performance: isolate paint/layout; safe for embedded SVG usage */
+  contain: layout paint;
+}
+
+[data-page-root] [data-region] {
+  pointer-events: all;
+
+  /* UX: signal interactivity; safe for desktop. Mobile ignores cursor. */
+  cursor: pointer;
+}
+
+[data-page-root] [data-role="outline"] {
+  pointer-events: none;
+}
+
+/* Optional: prevent outlines inside regions from capturing events if authoring mistakes occur */
+[data-page-root] [data-region] [data-role="outline"] {
+  pointer-events: none;
+}
+
+/* ===== Tap surface helpers (optional but useful) ===== */
+
+/* Use on the container that hosts the SVG (recommended: a wrapper <div>) */
+.t2f-canvas {
+  border-radius: 14px;
+  border: 1px solid rgba(127, 127, 127, 0.25);
+  background: rgba(127, 127, 127, 0.06);
+  padding: 10px;
+
+  /* Mobile: allow taps but avoid pinch/scroll conflicts; safe default for Stage 2 */
+  touch-action: manipulation;
+}
+
+/* Host that receives the mounted SVG (App.tsx sets aspect ratio + centering) */
+.t2f-svgHost {
+  width: 100%;
+  max-width: 520px;
+  margin: 0 auto;
+  aspect-ratio: 1 / 1;
+  display: grid;
+  place-items: center;
+}
+
+/* ===== Optional small UI primitives used by App.tsx (kept neutral) ===== */
+
+.t2f-card {
+  border: 1px solid rgba(127, 127, 127, 0.25);
+  border-radius: 14px;
+  padding: 14px;
+}
+
+.t2f-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.t2f-rowMuted {
+  opacity: 0.8;
+}
+
+.t2f-panel {
+  padding: 12px;
+  border-radius: 12px;
+  background: rgba(127, 127, 127, 0.08);
+}
+
+.t2f-panelAlt {
+  background: rgba(127, 127, 127, 0.06);
+}
+
+.t2f-btn {
+  width: 100%;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(127, 127, 127, 0.35);
+  background: transparent;
+  font-weight: 650;
+}
+
+.t2f-pre {
+  padding: 10px;
+  border-radius: 12px;
+  background: rgba(127, 127, 127, 0.10);
+  overflow: auto;
+}
+
+.t2f-footnote {
+  font-size: 12px;
+  opacity: 0.65;
+}
+
+.t2f-palette {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.t2f-swatch {
+  width: 32px;
+  height: 32px;
+  border-radius: 10px;
+  border: 1px solid rgba(127, 127, 127, 0.25);
+}
+
+.t2f-swatchActive {
+  border: 2px solid rgba(127, 127, 127, 0.85);
+}
+
+.t2f-activeColor {
+  margin-left: auto;
+  opacity: 0.75;
+  font-size: 13px;
+}
+
+.t2f-meta {
+  font-size: 13px;
+  opacity: 0.85;
+}
+
+/* Accessibility: reduce any future transitions/animations if added */
+@media (prefers-reduced-motion: reduce) {
+  [data-page-root] [data-region] {
+    scroll-behavior: auto;
+  }
+}

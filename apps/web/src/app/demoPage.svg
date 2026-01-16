@@ -1,15 +1,138 @@
-<!-- apps/web/src/app/demoPage.svg -->
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 360">
-  <!-- regions (clickable) -->
-  <path data-region="R001" d="M30 40 H170 V170 H30 Z" fill="#ffffff"/>
-  <path data-region="R002" d="M190 40 H330 V170 H190 Z" fill="#ffffff"/>
-  <path data-region="R003" d="M30 190 H330 V330 H30 Z" fill="#ffffff"/>
+<!-- apps/web/src/app/demoPage.svg
+     Stage 2 demo SVG contract (Tap-to-Fill)
+     Requirements:
+       - viewBox is present
+       - clickable regions use data-region="R###"
+       - outline/decor uses data-role="outline" (pointer-events disabled by CSS policy in App)
+-->
+<svg
+  xmlns="http://www.w3.org/2000/svg"
+  viewBox="0 0 512 512"
+  width="512"
+  height="512"
+  role="img"
+  aria-label="Tap2Fill demo page"
+>
+  <title>Tap2Fill Demo Page</title>
+  <desc>Simple demo page with multiple regions for tap-to-fill testing.</desc>
 
-  <!-- outline/decor (NOT clickable) -->
-  <g data-role="outline" fill="none" stroke="#111827" stroke-width="6" vector-effect="non-scaling-stroke">
-    <rect x="30" y="40" width="140" height="130" rx="16"/>
-    <rect x="190" y="40" width="140" height="130" rx="16"/>
-    <rect x="30" y="190" width="300" height="140" rx="18"/>
-    <path d="M180 20V340" opacity="0.15"/>
+  <!-- Background (not interactive) -->
+  <rect x="0" y="0" width="512" height="512" fill="#ffffff" data-role="outline" />
+
+  <!-- Regions (interactive): use stable IDs and data-region="R###" -->
+  <!-- Region 1: top-left rounded panel -->
+  <path
+    data-region="R001"
+    d="M72 84
+       Q72 64 92 64
+       H240
+       Q260 64 260 84
+       V216
+       Q260 236 240 236
+       H92
+       Q72 236 72 216
+       Z"
+    fill="#f3f4f6"
+  />
+
+  <!-- Region 2: top-right rounded panel -->
+  <path
+    data-region="R002"
+    d="M272 84
+       Q272 64 292 64
+       H420
+       Q440 64 440 84
+       V216
+       Q440 236 420 236
+       H292
+       Q272 236 272 216
+       Z"
+    fill="#eef2ff"
+  />
+
+  <!-- Region 3: bottom-left rounded panel -->
+  <path
+    data-region="R003"
+    d="M72 296
+       Q72 276 92 276
+       H240
+       Q260 276 260 296
+       V428
+       Q260 448 240 448
+       H92
+       Q72 448 72 428
+       Z"
+    fill="#ecfeff"
+  />
+
+  <!-- Region 4: bottom-right rounded panel -->
+  <path
+    data-region="R004"
+    d="M272 296
+       Q272 276 292 276
+       H420
+       Q440 276 440 296
+       V428
+       Q440 448 420 448
+       H292
+       Q272 448 272 428
+       Z"
+    fill="#fef9c3"
+  />
+
+  <!-- Decorative outline / separators (non-interactive; CSS disables pointer events) -->
+  <g data-role="outline" fill="none" stroke="rgba(0,0,0,0.20)" stroke-width="6" stroke-linejoin="round">
+    <path
+      d="M72 84
+         Q72 64 92 64
+         H240
+         Q260 64 260 84
+         V216
+         Q260 236 240 236
+         H92
+         Q72 236 72 216
+         Z"
+    />
+    <path
+      d="M272 84
+         Q272 64 292 64
+         H420
+         Q440 64 440 84
+         V216
+         Q440 236 420 236
+         H292
+         Q272 236 272 216
+         Z"
+    />
+    <path
+      d="M72 296
+         Q72 276 92 276
+         H240
+         Q260 276 260 296
+         V428
+         Q260 448 240 448
+         H92
+         Q72 448 72 428
+         Z"
+    />
+    <path
+      d="M272 296
+         Q272 276 292 276
+         H420
+         Q440 276 440 296
+         V428
+         Q440 448 420 448
+         H292
+         Q272 236 272 216
+         Z"
+    />
+  </g>
+
+  <!-- Small labels (decorative only) -->
+  <g data-role="outline" font-family="system-ui, -apple-system, Segoe UI, Roboto, Arial" font-size="20" fill="rgba(0,0,0,0.45)">
+    <text x="92"  y="116">R001</text>
+    <text x="292" y="116">R002</text>
+    <text x="92"  y="328">R003</text>
+    <text x="292" y="328">R004</text>
   </g>
 </svg>

@@ -13,11 +13,27 @@ import {
 import { clearPendingMeState, enqueueMeState, loadPendingMeState } from "../local/outbox";
 
 import demoSvg from "./demoPage.svg?raw";
-import { hitTestRegion } from "./hitTest";
 import { DEFAULT_PALETTE, applyFillsToContainer, safeColorIndex, type FillMap } from "./coloring";
+import {
+  applyFillToRegion,
+  hitTestRegionAtPoint,
+  mountSvgIntoHost,
+  type MountResult,
+} from "./svgTapToFill";
+
+import "./svgTapToFill.css";
 
 const DEMO_PAGE_ID = "page_demo_1";
 const DEMO_CONTENT_HASH = "demo_hash_v1";
+
+/**
+ * Stage 2 (Happy Path) – One page tap-to-fill
+ * Goals:
+ *  - TMA bootstrap + safe-area sizing
+ *  - SVG contract: viewBox + data-region + outline pointer-events off
+ *  - Hardened hit test: elementFromPoint -> climb to [data-region]
+ *  - Local-first: apply fill instantly; advance clientRev; snapshot; enqueue me/state; batched sync
+ */
 
 function safeJson(x: unknown): string {
   try {
@@ -27,12 +43,16 @@ function safeJson(x: unknown): string {
   }
 }
 
+function clampInt(n: number, min: number, max: number): number {
+  if (!Number.isFinite(n)) return min;
+  return Math.max(min, Math.min(max, Math.trunc(n)));
+}
 
 export default function App() {
   const [out, setOut] = useState("idle");
   const [tick, setTick] = useState(0);
 
-  // Local-first state (existing)
+  // Local-first state
   const [clientRev, setClientRev] = useState(0);
   const [demoCounter, setDemoCounter] = useState(0);
   const [lastPageId, setLastPageId] = useState<string | null>(null);
@@ -47,10 +67,29 @@ export default function App() {
 
   const svgHostRef = useRef<HTMLDivElement | null>(null);
 
+  // Batched sync refs
+  const flushTimerRef = useRef<number | null>(null);
+  const flushingRef = useRef(false);
+
+  // Keep stable references for async flows
+  const clientRevRef = useRef(0);
+  const demoCounterRef = useRef(0);
+
+  useEffect(() => {
+    clientRevRef.current = clientRev;
+  }, [clientRev]);
+
+  useEffect(() => {
+    demoCounterRef.current = demoCounter;
+  }, [demoCounter]);
+
   useEffect(() => {
     const cleanup = tmaBootstrap();
+
+    // Small tick window: for initData length label without rerenders forever
     const id = window.setInterval(() => setTick((t) => t + 1), 250);
     window.setTimeout(() => window.clearInterval(id), 3000);
+
     return () => {
       window.clearInterval(id);
       cleanup?.();
@@ -99,19 +138,20 @@ export default function App() {
         const st = res.state;
         if (!st) return;
 
-        // Only if server is strictly ahead
-        if (st.clientRev > clientRev) {
+        if (st.clientRev > clientRevRef.current) {
           setClientRev(st.clientRev);
           setLastPageId(st.lastPageId);
 
+          // In Stage 2 we keep fills local-only; rev is synced via snapshot.
           const snap: PageSnapshotV1 = {
             schemaVersion: 1,
             pageId: DEMO_PAGE_ID,
             contentHash: DEMO_CONTENT_HASH,
             clientRev: st.clientRev,
-            demoCounter, // kept local in this stage
+            demoCounter: demoCounterRef.current,
             updatedAtMs: Date.now(),
           };
+
           await savePageSnapshot(snap);
           await saveLastPageId(st.lastPageId);
         }
@@ -123,14 +163,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [canCallServer, clientRev, demoCounter]);
-
-  /**
-   * Batched sync (debounced push).
-   */
-  const flushTimerRef = useRef<number | null>(null);
-  const flushingRef = useRef(false);
+  }, [canCallServer]);
 
   async function flushOutboxOnce(): Promise<void> {
     if (!canCallServer) return;
@@ -166,33 +199,34 @@ export default function App() {
     flushTimerRef.current = window.setTimeout(() => {
       flushTimerRef.current = null;
       void flushOutboxOnce();
-    }, delayMs);
+    }, Math.max(0, Math.trunc(delayMs)));
   }
 
   // On boot: attempt to flush pending outbox (best-effort).
   useEffect(() => {
     if (!canCallServer) return;
     void flushOutboxOnce();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [canCallServer]);
 
-  // ===== Stage 2: SVG mount + apply fills =====
+  // ===== Stage 2: SVG mount + contract enforcement + apply fills =====
   useEffect(() => {
     const host = svgHostRef.current;
     if (!host) return;
 
-    host.innerHTML = demoSvg;
+    const res: MountResult = mountSvgIntoHost(host, demoSvg, {
+      requireViewBox: true,
+      requireRegionIdPattern: true,
+      regionIdPattern: /^R\d{3}$/,
+      sanitize: true,
+    });
 
-    const svg = host.querySelector("svg");
-    if (!svg) {
-      setOut((prev) => (prev === "idle" ? "WARN: SVG not mounted" : prev));
+    if (!res.ok) {
+      setOut((prev) => (prev === "idle" ? `ERR: ${res.reason}` : prev));
+      host.replaceChildren();
       return;
     }
 
-    // Mark root for CSS policies
-    svg.setAttribute("data-page-root", "1");
-
-    // Apply current fills
+    // Apply current fills (local-only in Stage 2)
     applyFillsToContainer(host, fills);
   }, [fills]);
 
@@ -200,11 +234,15 @@ export default function App() {
     return DEFAULT_PALETTE[safeColorIndex(paletteIdx)];
   }
 
-  // Local-first action (existing): snapshot immediately + enqueue server write + schedule batched push
-  async function simulateLocalAction() {
-    const nextRev = clientRev + 1;
-    const nextCounter = demoCounter + 1;
+  /**
+   * Local-first action: advance rev + persist snapshot + enqueue server me/state + schedule batched push.
+   * Stage 2: snapshot does not yet contain fills (progress comes next), but rev stays monotonic.
+   */
+  async function advanceLocalRevAndEnqueue(): Promise<void> {
+    const nextRev = clientRevRef.current + 1;
+    const nextCounter = demoCounterRef.current + 1;
 
+    // Update state immediately
     setClientRev(nextRev);
     setDemoCounter(nextCounter);
 
@@ -260,7 +298,15 @@ export default function App() {
     const host = svgHostRef.current;
     if (!host) return;
 
-    const hit = hitTestRegion(e.clientX, e.clientY);
+    // Clamp coords defensively (viewport coords)
+    const x = clampInt(e.clientX, 0, window.innerWidth);
+    const y = clampInt(e.clientY, 0, window.innerHeight);
+
+    const hit = hitTestRegionAtPoint(x, y, {
+      requireRegionIdPattern: true,
+      regionIdPattern: /^R\d{3}$/,
+    });
+
     if (!hit) {
       setLastTap("tap: no region");
       return;
@@ -269,8 +315,7 @@ export default function App() {
     const color = activeColor();
 
     // Apply to DOM immediately (responsiveness)
-    const el = host.querySelector(`[data-region="${CSS.escape(hit.regionId)}"]`);
-    if (el) el.setAttribute("fill", color);
+    applyFillToRegion(host, hit.regionId, color);
 
     // Commit local fill state
     setFills((prev) => {
@@ -280,10 +325,8 @@ export default function App() {
 
     setLastTap(`filled ${hit.regionId} -> ${color}`);
 
-    // Treat a fill as a local-first action that advances rev.
-    // For Stage 2 we link coloring interaction to the same local-first pipeline:
-    // snapshot + enqueue server me/state (cross-device restore).
-    await simulateLocalAction();
+    // Advance revision + enqueue cross-device restore sync
+    await advanceLocalRevAndEnqueue();
   }
 
   async function resetLocal() {
@@ -315,185 +358,95 @@ export default function App() {
       <p style={{ opacity: 0.7, marginTop: 6 }}>Local-first + server restore + batched sync + tap-to-fill</p>
 
       {/* Stage 2: Coloring surface */}
-      <div
-        style={{
-          marginTop: 12,
-          border: "1px solid rgba(127,127,127,0.25)",
-          borderRadius: 14,
-          padding: 14,
-        }}
-      >
-        <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+      <div className="t2f-card" style={{ marginTop: 12 }}>
+        <div className="t2f-row">
           <span>Runtime</span>
           <strong>{runtimeLabel}</strong>
         </div>
 
-        <div style={{ display: "flex", justifyContent: "space-between", gap: 12, marginTop: 8, opacity: 0.8 }}>
+        <div className="t2f-row t2f-rowMuted" style={{ marginTop: 8 }}>
           <span>initData length</span>
           <strong>{initDataLen}</strong>
         </div>
 
-        <div style={{ marginTop: 12, display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+        <div className="t2f-palette" style={{ marginTop: 12 }}>
           {DEFAULT_PALETTE.map((c, idx) => {
             const active = idx === safeColorIndex(paletteIdx);
             return (
               <button
                 key={c}
                 onClick={() => setPaletteIdx(idx)}
-                style={{
-                  width: 32,
-                  height: 32,
-                  borderRadius: 10,
-                  border: active ? "2px solid rgba(127,127,127,0.85)" : "1px solid rgba(127,127,127,0.25)",
-                  background: c,
-                }}
+                className={active ? "t2f-swatch t2f-swatchActive" : "t2f-swatch"}
+                style={{ background: c }}
                 aria-label={`color ${c}`}
               />
             );
           })}
-          <span style={{ marginLeft: "auto", opacity: 0.75, fontSize: 13 }}>
+          <span className="t2f-activeColor">
             Active: <strong>{activeColor()}</strong>
           </span>
         </div>
 
-        <div
-          onPointerDown={onPointerDown}
-          style={{
-            marginTop: 12,
-            borderRadius: 14,
-            border: "1px solid rgba(127,127,127,0.25)",
-            background: "rgba(127,127,127,0.06)",
-            padding: 10,
-            touchAction: "manipulation",
-          }}
-        >
-          <div
-            ref={svgHostRef}
-            style={{
-              width: "100%",
-              maxWidth: 520,
-              margin: "0 auto",
-              aspectRatio: "1 / 1",
-              display: "grid",
-              placeItems: "center",
-            }}
-          />
-
-          {/* Hit-test hardening policy */}
-          <style>{`
-            [data-page-root] { width: 100%; height: auto; display: block; }
-            [data-page-root] { pointer-events: none; }
-            [data-page-root] [data-region] { pointer-events: all; }
-            [data-page-root] [data-role="outline"] { pointer-events: none; }
-          `}</style>
+        <div className="t2f-canvas" onPointerDown={onPointerDown} style={{ marginTop: 12 }}>
+          <div ref={svgHostRef} className="t2f-svgHost" />
         </div>
 
-        <div style={{ marginTop: 10, fontSize: 13, opacity: 0.85 }}>
+        <div className="t2f-meta" style={{ marginTop: 10 }}>
           Last tap: <strong>{lastTap}</strong> · Filled: <strong>{Object.keys(fills).length}</strong>
         </div>
       </div>
 
-      {/* Existing debug panel (kept) */}
-      <div style={{ marginTop: 12, border: "1px solid rgba(127,127,127,0.25)", borderRadius: 14, padding: 14 }}>
-        <div style={{ marginTop: 12, padding: 12, borderRadius: 12, background: "rgba(127,127,127,0.08)" }}>
-          <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+      {/* Debug panel (kept) */}
+      <div className="t2f-card" style={{ marginTop: 12 }}>
+        <div className="t2f-panel">
+          <div className="t2f-row">
             <span>Local lastPageId</span>
             <strong>{lastPageId ?? "null"}</strong>
           </div>
-          <div style={{ display: "flex", justifyContent: "space-between", gap: 12, marginTop: 6 }}>
+          <div className="t2f-row" style={{ marginTop: 6 }}>
             <span>Local clientRev</span>
             <strong>{clientRev}</strong>
           </div>
-          <div style={{ display: "flex", justifyContent: "space-between", gap: 12, marginTop: 6 }}>
+          <div className="t2f-row" style={{ marginTop: 6 }}>
             <span>Local demoCounter</span>
             <strong>{demoCounter}</strong>
           </div>
         </div>
 
-        <div style={{ marginTop: 12, padding: 12, borderRadius: 12, background: "rgba(127,127,127,0.06)" }}>
-          <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+        <div className="t2f-panel t2f-panelAlt" style={{ marginTop: 12 }}>
+          <div className="t2f-row">
             <span>Server lastPageId</span>
             <strong>{serverState?.lastPageId ?? "null"}</strong>
           </div>
-          <div style={{ display: "flex", justifyContent: "space-between", gap: 12, marginTop: 6 }}>
+          <div className="t2f-row" style={{ marginTop: 6 }}>
             <span>Server clientRev</span>
             <strong>{serverState?.clientRev ?? 0}</strong>
           </div>
         </div>
 
-        <button
-          onClick={simulateLocalAction}
-          style={{
-            marginTop: 12,
-            width: "100%",
-            padding: "10px 12px",
-            borderRadius: 12,
-            border: "1px solid rgba(127,127,127,0.35)",
-            background: "transparent",
-            fontWeight: 650,
-          }}
-        >
+        <button className="t2f-btn" onClick={advanceLocalRevAndEnqueue} style={{ marginTop: 12 }}>
           Simulate Local Action (snapshot + enqueue sync)
         </button>
 
-        <button
-          onClick={testIdempotencySameClientRev}
-          disabled={!canDebugServer}
-          style={{
-            marginTop: 10,
-            width: "100%",
-            padding: "10px 12px",
-            borderRadius: 12,
-            border: "1px solid rgba(127,127,127,0.35)",
-            background: "transparent",
-            fontWeight: 650,
-            opacity: !canDebugServer ? 0.5 : 0.9,
-          }}
-        >
+        <button className="t2f-btn" onClick={testIdempotencySameClientRev} disabled={!canDebugServer} style={{ marginTop: 10, opacity: !canDebugServer ? 0.5 : 0.9 }}>
           Test Idempotency (same clientRev)
         </button>
 
-        <button
-          onClick={runSmokePutState}
-          disabled={!canDebugServer}
-          style={{
-            marginTop: 10,
-            width: "100%",
-            padding: "10px 12px",
-            borderRadius: 12,
-            border: "1px solid rgba(127,127,127,0.35)",
-            background: "transparent",
-            fontWeight: 650,
-            opacity: !canDebugServer ? 0.5 : 1,
-          }}
-        >
+        <button className="t2f-btn" onClick={runSmokePutState} disabled={!canDebugServer} style={{ marginTop: 10, opacity: !canDebugServer ? 0.5 : 1 }}>
           Run Smoke Test (PUT /v1/me/state)
         </button>
 
-        <button
-          onClick={resetLocal}
-          style={{
-            marginTop: 10,
-            width: "100%",
-            padding: "10px 12px",
-            borderRadius: 12,
-            border: "1px solid rgba(127,127,127,0.35)",
-            background: "transparent",
-            fontWeight: 650,
-            opacity: 0.9,
-          }}
-        >
+        <button className="t2f-btn" onClick={resetLocal} style={{ marginTop: 10, opacity: 0.9 }}>
           Reset Local Snapshot
         </button>
 
-        <pre style={{ marginTop: 12, padding: 10, borderRadius: 12, background: "rgba(127,127,127,0.10)" }}>
+        <pre className="t2f-pre" style={{ marginTop: 12 }}>
           {out}
         </pre>
       </div>
 
-      <div style={{ marginTop: 10, fontSize: 12, opacity: 0.65 }}>
-        Note: Stage 2 links each fill to the existing local-first pipeline by advancing clientRev and syncing /v1/me/state.
-        Region-level progress persistence will be introduced in the next step (progress API + page snapshot payload).
+      <div className="t2f-footnote" style={{ marginTop: 10 }}>
+        Stage 2: fills are local-only; we sync only (lastPageId, clientRev) for cross-device restore of the user’s last page. Next step: persist fills via page snapshot payload and/or /v1/progress.
       </div>
     </div>
   );

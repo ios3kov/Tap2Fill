@@ -1,15 +1,17 @@
 // apps/web/src/lib/tma.ts
 /* Minimal, robust Telegram Mini App bootstrap:
-   - WebApp.ready() + expand()
-   - theme params -> CSS vars
+   - WebApp.ready() + WebApp.expand()
+   - theme params -> CSS vars (--tg-theme-*)
    - safe height via --tg-vh (visualViewport-aware)
+   - idempotent, safe in non-TMA (no-op)
 */
 
-type TgThemeParams = Record<string, string | undefined>;
+export type TgThemeParams = Record<string, string | undefined>;
 
-type TgWebApp = {
+export type TgWebApp = {
   initData?: string;
   themeParams?: TgThemeParams;
+  colorScheme?: "light" | "dark";
   ready?: () => void;
   expand?: () => void;
   onEvent?: (event: string, cb: () => void) => void;
@@ -18,9 +20,11 @@ type TgWebApp = {
 
 type TgRoot = { WebApp?: TgWebApp };
 
+type TelegramWindow = Window & { Telegram?: TgRoot };
+
 function getTg(): TgRoot | null {
-  const w = window as unknown as { Telegram?: TgRoot };
-  return w.Telegram ?? null;
+  const ww = window as TelegramWindow;
+  return ww.Telegram ?? null;
 }
 
 export function isTma(): boolean {
@@ -29,11 +33,17 @@ export function isTma(): boolean {
 
 export function getInitData(): string {
   const v = getTg()?.WebApp?.initData ?? "";
-  return typeof v === "string" ? v : "";
+  return typeof v === "string" ? v.trim() : "";
 }
 
 function setCssVar(name: string, value: string) {
   document.documentElement.style.setProperty(name, value);
+}
+
+function normalizeThemeKey(k: string): string {
+  // Telegram provides snake_case keys; expose as kebab-case.
+  // Keep it predictable and stable.
+  return k.replaceAll("_", "-").trim();
 }
 
 function updateTgVh() {
@@ -48,36 +58,64 @@ function applyThemeVars(theme?: TgThemeParams) {
   // Telegram provides keys like: bg_color, text_color, hint_color, button_color, button_text_color, etc.
   // We expose them as CSS vars in a predictable format: --tg-theme-<key>
   for (const [k, v] of Object.entries(theme)) {
-    if (!v) continue;
-    setCssVar(`--tg-theme-${k.replaceAll("_", "-")}`, v);
+    const val = typeof v === "string" ? v.trim() : "";
+    if (!val) continue;
+    setCssVar(`--tg-theme-${normalizeThemeKey(k)}`, val);
   }
 }
+
+function applyColorSchemeHint(scheme?: "light" | "dark") {
+  // Optional but useful for CSS selectors and future theming.
+  // No security impact; safe in all contexts.
+  const root = document.documentElement;
+  root.setAttribute("data-tg-scheme", scheme === "dark" ? "dark" : "light");
+}
+
+export type TmaCleanup = () => void;
 
 /**
  * Call once on app mount.
  * Safe in non-TMA (no-op).
+ *
+ * Returns cleanup for installed listeners.
  */
-export function tmaBootstrap() {
+export function tmaBootstrap(): TmaCleanup {
   updateTgVh();
 
   const tg = getTg()?.WebApp;
+
+  // Best-effort Telegram calls (never hard-fail).
   if (tg) {
     try {
       tg.ready?.();
+    } catch {
+      // ignore
+    }
+    try {
       tg.expand?.();
     } catch {
-      // Never hard-fail bootstrap.
+      // ignore
     }
+
     applyThemeVars(tg.themeParams);
+    applyColorSchemeHint(tg.colorScheme);
+  } else {
+    // In non-TMA we still set a sane default for predictable styling.
+    applyColorSchemeHint("light");
   }
 
   const onResize = () => updateTgVh();
-  window.addEventListener("resize", onResize);
-  window.visualViewport?.addEventListener("resize", onResize);
+
+  // Window resize + visualViewport resize for best coverage.
+  window.addEventListener("resize", onResize, { passive: true });
+  window.visualViewport?.addEventListener("resize", onResize, { passive: true });
 
   const onThemeChanged = () => {
-    const t = getTg()?.WebApp?.themeParams;
-    applyThemeVars(t);
+    const wa = getTg()?.WebApp;
+    applyThemeVars(wa?.themeParams);
+    applyColorSchemeHint(wa?.colorScheme);
+    // Some clients adjust chrome on theme change; keep vh fresh.
+    updateTgVh();
   };
 
   // Telegram events (best-effort)
