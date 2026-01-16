@@ -241,12 +241,13 @@ export default function App() {
 
   const onCanvasPointerUpCapture = (e: React.PointerEvent) => {
     if (e.pointerType !== "touch") return
-    activeTouchIdsRef.current.delete(e.pointerId)
+    // IMPORTANT: do not delete pointerId here; onPointerUp needs it for its debounce checks.
   }
 
   const onCanvasPointerCancelCapture = (e: React.PointerEvent) => {
     if (e.pointerType !== "touch") return
-    activeTouchIdsRef.current.delete(e.pointerId)
+    // Pointer got cancelled: clear just in case.
+    // IMPORTANT: do not delete pointerId here; onPointerUp uses it for debounce checks.
   }
 
   useEffect(() => {
@@ -594,6 +595,15 @@ export default function App() {
     e.stopPropagation()
 
     const isTouch = e.pointerType === "touch"
+
+    // Cleanup: ensure touch pointerId does not accumulate even on early returns.
+    // Delay must be > debounce window used below.
+    const touchPid = isTouch ? e.pointerId : -1
+    if (isTouch) {
+      window.setTimeout(() => {
+        activeTouchIdsRef.current.delete(touchPid)
+      }, 250)
+    }
 
     // Never fill while zoom/pan is actively gesturing.
     if (isGesturingRef.current) return
