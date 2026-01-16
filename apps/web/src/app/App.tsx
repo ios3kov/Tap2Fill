@@ -269,8 +269,7 @@ export default function App() {
     setPaletteIdx(m.nextPaletteIdx)
     setLastTap(m.tapLabel)
 
-    const undoStackB64 =
-      m.nextUndoStackB64 ?? history.refs.undoStackRef.current
+    const undoStackB64 = m.nextUndoStackB64 ?? history.refs.undoStackRef.current
     const undoUsed = m.nextUndoUsed ?? history.refs.undoUsedRef.current
 
     await persistSnapshotNow({
@@ -655,7 +654,7 @@ export default function App() {
 
             <button
               className="t2f-btn"
-              onClick={() => outbox.scheduleFlush(0)}
+              onClick={() => void outbox.scheduleFlush(0)}
               style={{ marginTop: 12 }}
             >
               Flush Outbox Now

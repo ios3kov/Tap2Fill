@@ -33,7 +33,9 @@ export type UndoHistory = {
   }
 }
 
-export function useUndoHistory(params: { budgetPerSession: number }): UndoHistory {
+export function useUndoHistory(params: {
+  budgetPerSession: number
+}): UndoHistory {
   const [undoStackB64, setUndoStackB64] = useState<string[]>([])
   const [undoBudgetUsed, setUndoBudgetUsed] = useState(0)
 
