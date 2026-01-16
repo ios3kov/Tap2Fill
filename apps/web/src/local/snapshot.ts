@@ -1,4 +1,11 @@
 // apps/web/src/local/snapshot.ts
+import {
+  PROGRESS_UNPAINTED,
+  decodeBase64ToBytes,
+  encodeBytesToBase64,
+  makeEmptyProgressBytes,
+  type PackOptions,
+} from "../app/progress/pack"
 import { delKey, getJson, setJson } from "./storage"
 
 export type PageId = string
@@ -18,10 +25,10 @@ export type PageSnapshotV1 = {
 /**
  * Current snapshot (Stage 3+), aligned with App.tsx usage.
  *
- * NOTE:
+ * Contract:
  * - Packed progress is the source of truth.
- * - `fills` is allowed as an optional debug/compat field (so App.tsx can pass it),
- *   but we intentionally do not persist it to storage to avoid bloat/duplication.
+ * - `fills` is allowed as an optional debug/compat field, but we do NOT persist it
+ *   to avoid duplication and storage bloat.
  */
 export type PageSnapshotV2 = {
   schemaVersion: 2
@@ -40,8 +47,7 @@ export type PageSnapshotV2 = {
   regionsCount: number
   paletteLen: number
 
-  // Undo (Stage 3): stack items are base64 strings (historical packed progress snapshots),
-  // budgeted by session.
+  // Undo (Stage 3): packed base64 history snapshots.
   undoStackB64: string[]
   undoBudgetUsed: number
 
@@ -50,7 +56,7 @@ export type PageSnapshotV2 = {
 
 /**
  * Back-compat helper type:
- * In some intermediate builds, storage might contain `undoStackJson`.
+ * Some intermediate builds might contain `undoStackJson`.
  * We accept it on read, but never persist it.
  */
 type PageSnapshotV2Legacy = PageSnapshotV2 & {
@@ -68,11 +74,17 @@ export type LocalUserStateV1 = {
 const KEY_PREFIX = "t2f:v2"
 const KEY_LAST_PAGE = `${KEY_PREFIX}:user:lastPage`
 
-const UNPAINTED = 255
+const UNPAINTED = PROGRESS_UNPAINTED
 const MAX_UNDO_STACK = 64
 const MAX_REGIONS = 20_000
 const MAX_PALETTE_LEN = 64
 const MAX_B64_LEN = 200_000
+
+// Keep pack decoding strict, but enforce local caps as defense-in-depth.
+const PACK_OPTS: PackOptions = {
+  maxRegions: MAX_REGIONS,
+  maxPaletteLen: MAX_PALETTE_LEN,
+}
 
 function isNonEmptyString(v: unknown): v is string {
   return typeof v === "string" && v.trim().length > 0
@@ -90,36 +102,35 @@ function clampInt(n: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, x))
 }
 
-function bytesToBase64(bytes: Uint8Array): string {
-  let bin = ""
-  const CHUNK = 0x8000
-  for (let i = 0; i < bytes.length; i += CHUNK) {
-    const slice = bytes.subarray(i, i + CHUNK)
-    bin += String.fromCharCode(...slice)
-  }
-  return btoa(bin)
+function pickUpdatedAtMs(v: unknown): number {
+  return isFiniteNonNegativeInt(v) ? v : Date.now()
 }
 
-function base64ToBytes(b64: string): Uint8Array | null {
-  const s = typeof b64 === "string" ? b64.trim() : ""
-  if (!s) return null
-  if (s.length > MAX_B64_LEN) return null
+/**
+ * Base64 length is deterministic for a given bytes length (with padding):
+ * b64Len = 4 * ceil(n / 3)
+ */
+function expectedBase64LenForBytesLen(bytesLen: number): number {
+  const n = clampInt(bytesLen, 0, MAX_REGIONS)
+  return 4 * Math.ceil(n / 3)
+}
 
-  try {
-    const bin = atob(s)
-    const out = new Uint8Array(bin.length)
-    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i) & 0xff
-    return out
-  } catch {
-    return null
-  }
+function isLikelyBase64(s: string): boolean {
+  // Fast structural checks only (no decoding).
+  // - length multiple of 4
+  // - allowed alphabet + optional padding
+  // - bounded length
+  if (!s) return false
+  if (s.length > MAX_B64_LEN) return false
+  if (s.length % 4 !== 0) return false
+  return /^[A-Za-z0-9+/]+={0,2}$/.test(s)
 }
 
 function makeEmptyProgressB64(regionsCount: number): string {
   const rc = clampInt(regionsCount, 0, MAX_REGIONS)
-  const bytes = new Uint8Array(rc)
-  bytes.fill(UNPAINTED)
-  return bytesToBase64(bytes)
+  if (rc === 0) return "" // 0 bytes => empty base64
+  const bytes = makeEmptyProgressBytes(rc, PACK_OPTS)
+  return encodeBytesToBase64(bytes)
 }
 
 function sanitizeProgressB64(params: {
@@ -134,12 +145,17 @@ function sanitizeProgressB64(params: {
     ? clampInt(params.paletteLen, 0, MAX_PALETTE_LEN)
     : 0
 
+  // For a page with 0 regions, the only valid representation is empty.
+  if (rc === 0) {
+    return { progressB64: "", regionsCount: 0, paletteLen: pl }
+  }
+
   const rawB64 = isNonEmptyString(params.progressB64)
     ? params.progressB64.trim()
     : ""
-  const bytes = rawB64 ? base64ToBytes(rawB64) : null
 
-  if (!bytes || bytes.length !== rc) {
+  // Cheap structural checks before decoding.
+  if (!rawB64 || !isLikelyBase64(rawB64)) {
     return {
       progressB64: makeEmptyProgressB64(rc),
       regionsCount: rc,
@@ -147,51 +163,57 @@ function sanitizeProgressB64(params: {
     }
   }
 
-  for (let i = 0; i < bytes.length; i++) {
-    const v = bytes[i]
-    if (v === UNPAINTED) continue
-    if (pl === 0 || v >= pl) {
-      return {
-        progressB64: makeEmptyProgressB64(rc),
-        regionsCount: rc,
-        paletteLen: pl,
-      }
+  const res = decodeBase64ToBytes(rawB64, rc, pl, PACK_OPTS)
+  if (!res.ok) {
+    return {
+      progressB64: makeEmptyProgressB64(rc),
+      regionsCount: rc,
+      paletteLen: pl,
     }
   }
 
-  // normalize (trim -> decode -> encode) not needed; keep as canonical from bytes
-  return { progressB64: bytesToBase64(bytes), regionsCount: rc, paletteLen: pl }
+  // Canonicalize: decode -> encode (stabilizes padding/format).
+  return { progressB64: encodeBytesToBase64(res.bytes), regionsCount: rc, paletteLen: pl }
 }
 
-function sanitizeUndoStackB64(input: unknown): string[] {
+function sanitizeUndoStackB64(input: unknown, expectedB64Len: number): string[] {
   if (!Array.isArray(input)) return []
+
   const out: string[] = []
   for (const item of input) {
     if (out.length >= MAX_UNDO_STACK) break
     if (typeof item !== "string") continue
+
     const s = item.trim()
     if (!s) continue
     if (s.length > MAX_B64_LEN) continue
-    // We do not decode each item here (expensive); structural check is enough.
-    // Full length check against progress happens in normalize/save.
+
+    // Fast validation: structure + exact expected base64 length for this page.
+    // This avoids expensive decode loops at load time.
+    if (s.length !== expectedB64Len) continue
+    if (!isLikelyBase64(s)) continue
+
     out.push(s)
   }
+
   return out
 }
 
 /**
  * Reads undo stack from v2 snapshot.
- * Accepts legacy `undoStackJson` (if it exists) by treating it as `undoStackB64`.
+ * Accepts legacy `undoStackJson` by treating it as `undoStackB64`.
  */
-function readUndoStackCompat(snap: PageSnapshotV2Legacy): string[] {
-  const canonical = sanitizeUndoStackB64((snap as PageSnapshotV2).undoStackB64)
+function readUndoStackCompat(
+  snap: PageSnapshotV2Legacy,
+  expectedB64Len: number,
+): string[] {
+  const canonical = sanitizeUndoStackB64(
+    (snap as PageSnapshotV2).undoStackB64,
+    expectedB64Len,
+  )
   if (canonical.length > 0) return canonical
 
-  // legacy fallback
-  const legacy = sanitizeUndoStackB64(
-    (snap as PageSnapshotV2Legacy).undoStackJson,
-  )
-  return legacy
+  return sanitizeUndoStackB64(snap.undoStackJson, expectedB64Len)
 }
 
 export function makePageKey(pageId: PageId, contentHash: ContentHash): string {
@@ -220,9 +242,7 @@ function normalizeV1(
   fallbackPaletteLen: number,
   fallbackRegionsCount: number,
 ): PageSnapshotV2 {
-  const paletteIdx = isFiniteNonNegativeInt(snap.paletteIdx)
-    ? snap.paletteIdx
-    : 0
+  const paletteIdx = isFiniteNonNegativeInt(snap.paletteIdx) ? snap.paletteIdx : 0
   const rc = clampInt(fallbackRegionsCount, 0, MAX_REGIONS)
   const pl = clampInt(fallbackPaletteLen, 0, MAX_PALETTE_LEN)
 
@@ -231,12 +251,9 @@ function normalizeV1(
     pageId,
     contentHash,
     clientRev: isFiniteNonNegativeInt(snap.clientRev) ? snap.clientRev : 0,
-    demoCounter: isFiniteNonNegativeInt(snap.demoCounter)
-      ? snap.demoCounter
-      : 0,
+    demoCounter: isFiniteNonNegativeInt(snap.demoCounter) ? snap.demoCounter : 0,
     paletteIdx,
 
-    // v1 fills intentionally dropped from persistence semantics; keep only optional in-memory if needed
     progressB64: makeEmptyProgressB64(rc),
     regionsCount: rc,
     paletteLen: pl,
@@ -244,9 +261,7 @@ function normalizeV1(
     undoStackB64: [],
     undoBudgetUsed: 0,
 
-    updatedAtMs: isFiniteNonNegativeInt(snap.updatedAtMs)
-      ? snap.updatedAtMs
-      : Date.now(),
+    updatedAtMs: pickUpdatedAtMs(snap.updatedAtMs),
   }
 }
 
@@ -260,18 +275,16 @@ function normalizeV2(
   if (snap.pageId !== pageId) return null
   if (snap.contentHash !== contentHash) return null
 
-  const paletteIdx = isFiniteNonNegativeInt(snap.paletteIdx)
-    ? snap.paletteIdx
-    : 0
+  const paletteIdx = isFiniteNonNegativeInt(snap.paletteIdx) ? snap.paletteIdx : 0
 
   const fallbackRc = clampInt(fallbackRegionsCount, 0, MAX_REGIONS)
   const fallbackPl = clampInt(fallbackPaletteLen, 0, MAX_PALETTE_LEN)
 
   const rcCandidate = isFiniteNonNegativeInt(snap.regionsCount)
-    ? snap.regionsCount
+    ? clampInt(snap.regionsCount, 0, MAX_REGIONS)
     : fallbackRc
   const plCandidate = isFiniteNonNegativeInt(snap.paletteLen)
-    ? snap.paletteLen
+    ? clampInt(snap.paletteLen, 0, MAX_PALETTE_LEN)
     : fallbackPl
 
   const p = sanitizeProgressB64({
@@ -283,40 +296,30 @@ function normalizeV2(
   const undoUsed = isFiniteNonNegativeInt(snap.undoBudgetUsed)
     ? clampInt(snap.undoBudgetUsed, 0, MAX_UNDO_STACK)
     : 0
-  const undoStackB64 = readUndoStackCompat(snap)
 
-  // Ensure undo snapshots match current progress length to avoid poisoning the undo stack.
-  const progressLen = base64ToBytes(p.progressB64)?.length ?? 0
-  const safeUndoStack =
-    progressLen > 0
-      ? undoStackB64.filter(
-          (b) => (base64ToBytes(b)?.length ?? -1) === progressLen,
-        )
-      : []
+  const expectedB64Len =
+    p.regionsCount > 0 ? expectedBase64LenForBytesLen(p.regionsCount) : 0
+  const undoStackB64 = readUndoStackCompat(snap, expectedB64Len)
 
   return {
     schemaVersion: 2,
     pageId,
     contentHash,
     clientRev: isFiniteNonNegativeInt(snap.clientRev) ? snap.clientRev : 0,
-    demoCounter: isFiniteNonNegativeInt(snap.demoCounter)
-      ? snap.demoCounter
-      : 0,
+    demoCounter: isFiniteNonNegativeInt(snap.demoCounter) ? snap.demoCounter : 0,
     paletteIdx,
 
-    // Keep if present (compat), but it's not used for correctness
+    // Keep if present (compat), but not used for correctness
     fills: snap.fills,
 
     progressB64: p.progressB64,
     regionsCount: p.regionsCount,
     paletteLen: p.paletteLen,
 
-    undoStackB64: safeUndoStack.slice(0, MAX_UNDO_STACK),
+    undoStackB64: undoStackB64.slice(0, MAX_UNDO_STACK),
     undoBudgetUsed: undoUsed,
 
-    updatedAtMs: isFiniteNonNegativeInt(snap.updatedAtMs)
-      ? snap.updatedAtMs
-      : Date.now(),
+    updatedAtMs: pickUpdatedAtMs(snap.updatedAtMs),
   }
 }
 
@@ -332,7 +335,7 @@ export async function loadPageSnapshot(
   const fallbackRegionsCount = clampInt(opts?.regionsCount ?? 0, 0, MAX_REGIONS)
   const fallbackPaletteLen = clampInt(opts?.paletteLen ?? 0, 0, MAX_PALETTE_LEN)
 
-  if ((snap as AnyPageSnapshot).schemaVersion === 2) {
+  if (snap.schemaVersion === 2) {
     return normalizeV2(
       snap as PageSnapshotV2Legacy,
       pageId,
@@ -342,7 +345,7 @@ export async function loadPageSnapshot(
     )
   }
 
-  if ((snap as AnyPageSnapshot).schemaVersion === 1) {
+  if (snap.schemaVersion === 1) {
     const v1 = snap as PageSnapshotV1
     if (v1.pageId !== pageId) return null
     if (v1.contentHash !== contentHash) return null
@@ -359,9 +362,7 @@ export async function loadPageSnapshot(
 }
 
 export async function savePageSnapshot(snap: PageSnapshotV2): Promise<void> {
-  const paletteIdx = isFiniteNonNegativeInt(snap.paletteIdx)
-    ? snap.paletteIdx
-    : 0
+  const paletteIdx = isFiniteNonNegativeInt(snap.paletteIdx) ? snap.paletteIdx : 0
 
   const p = sanitizeProgressB64({
     progressB64: snap.progressB64,
@@ -372,25 +373,17 @@ export async function savePageSnapshot(snap: PageSnapshotV2): Promise<void> {
   const undoUsed = isFiniteNonNegativeInt(snap.undoBudgetUsed)
     ? clampInt(snap.undoBudgetUsed, 0, MAX_UNDO_STACK)
     : 0
-  const undoStackB64 = sanitizeUndoStackB64(snap.undoStackB64)
 
-  // Filter undo stack by exact bytes length equality with current progress.
-  const progressLen = base64ToBytes(p.progressB64)?.length ?? 0
-  const safeUndoStack =
-    progressLen > 0
-      ? undoStackB64.filter(
-          (b) => (base64ToBytes(b)?.length ?? -1) === progressLen,
-        )
-      : []
+  const expectedB64Len =
+    p.regionsCount > 0 ? expectedBase64LenForBytesLen(p.regionsCount) : 0
+  const undoStackB64 = sanitizeUndoStackB64(snap.undoStackB64, expectedB64Len)
 
   const safe: PageSnapshotV2 = {
     schemaVersion: 2,
     pageId: snap.pageId,
     contentHash: snap.contentHash,
     clientRev: isFiniteNonNegativeInt(snap.clientRev) ? snap.clientRev : 0,
-    demoCounter: isFiniteNonNegativeInt(snap.demoCounter)
-      ? snap.demoCounter
-      : 0,
+    demoCounter: isFiniteNonNegativeInt(snap.demoCounter) ? snap.demoCounter : 0,
     paletteIdx,
 
     // Intentionally do not persist fills to avoid bloat.
@@ -398,12 +391,10 @@ export async function savePageSnapshot(snap: PageSnapshotV2): Promise<void> {
     regionsCount: p.regionsCount,
     paletteLen: p.paletteLen,
 
-    undoStackB64: safeUndoStack.slice(0, MAX_UNDO_STACK),
+    undoStackB64: undoStackB64.slice(0, MAX_UNDO_STACK),
     undoBudgetUsed: undoUsed,
 
-    updatedAtMs: isFiniteNonNegativeInt(snap.updatedAtMs)
-      ? snap.updatedAtMs
-      : Date.now(),
+    updatedAtMs: pickUpdatedAtMs(snap.updatedAtMs),
   }
 
   const key = makePageKey(safe.pageId, safe.contentHash)
