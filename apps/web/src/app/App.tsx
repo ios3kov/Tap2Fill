@@ -14,12 +14,7 @@ import { clearPendingMeState, enqueueMeState, loadPendingMeState } from "../loca
 
 import demoSvg from "./demoPage.svg?raw";
 import { DEFAULT_PALETTE, applyFillsToContainer, safeColorIndex, type FillMap } from "./coloring";
-import {
-  applyFillToRegion,
-  hitTestRegionAtPoint,
-  mountSvgIntoHost,
-  type MountResult,
-} from "./svgTapToFill";
+import { applyFillToRegion, hitTestRegionAtPoint, mountSvgIntoHost, type MountResult } from "./svgTapToFill";
 
 import "./svgTapToFill.css";
 
@@ -32,7 +27,7 @@ const DEMO_CONTENT_HASH = "demo_hash_v1";
  *  - TMA bootstrap + safe-area sizing
  *  - SVG contract: viewBox + data-region + outline pointer-events off (via css + mount)
  *  - Hardened hit test: elementFromPoint -> climb to [data-region]
- *  - Local-first: apply fill instantly; advance clientRev; snapshot; enqueue me/state; batched sync
+ *  - Local-first: apply fill instantly; persist fills locally; advance clientRev; snapshot; enqueue me/state; batched sync
  */
 
 function safeJson(x: unknown): string {
@@ -60,7 +55,7 @@ export default function App() {
   // Visibility: server
   const [serverState, setServerState] = useState<MeState | null>(null);
 
-  // Stage 2: coloring UI state (local-only)
+  // Stage 2: coloring UI state (LOCAL-FIRST persisted)
   const [paletteIdx, setPaletteIdx] = useState(0);
   const [fills, setFills] = useState<FillMap>({});
   const [lastTap, setLastTap] = useState<string>("none");
@@ -74,6 +69,8 @@ export default function App() {
   // Stable refs for async flows
   const clientRevRef = useRef(0);
   const demoCounterRef = useRef(0);
+  const paletteIdxRef = useRef(0);
+  const fillsRef = useRef<FillMap>({});
 
   useEffect(() => {
     clientRevRef.current = clientRev;
@@ -82,6 +79,14 @@ export default function App() {
   useEffect(() => {
     demoCounterRef.current = demoCounter;
   }, [demoCounter]);
+
+  useEffect(() => {
+    paletteIdxRef.current = paletteIdx;
+  }, [paletteIdx]);
+
+  useEffect(() => {
+    fillsRef.current = fills;
+  }, [fills]);
 
   useEffect(() => {
     const cleanup = tmaBootstrap();
@@ -103,16 +108,22 @@ export default function App() {
   // Restore local snapshots (no network)
   useEffect(() => {
     let cancelled = false;
+
     (async () => {
       const lp = await loadLastPageId();
       const snap = await loadPageSnapshot(DEMO_PAGE_ID, DEMO_CONTENT_HASH);
 
       if (cancelled) return;
+
       setLastPageId(lp);
 
       if (snap) {
         setClientRev(snap.clientRev);
         setDemoCounter(snap.demoCounter);
+
+        // Stage 2: restore fills + palette
+        if (snap.fills) setFills(snap.fills);
+        if (typeof snap.paletteIdx === "number") setPaletteIdx(safeColorIndex(snap.paletteIdx));
       }
     })();
 
@@ -124,6 +135,9 @@ export default function App() {
   /**
    * Server restore (pull on start):
    * If server.clientRev > local.clientRev -> apply locally.
+   *
+   * NOTE: Stage 2 stores fills locally only.
+   * Server restore updates rev/lastPageId; fills remain from local snapshot.
    */
   useEffect(() => {
     let cancelled = false;
@@ -144,13 +158,15 @@ export default function App() {
           setClientRev(st.clientRev);
           setLastPageId(st.lastPageId);
 
-          // Stage 2 keeps fills local-only; we persist rev for deterministic restore.
+          // Persist server-ahead rev locally without touching fills.
           const snap: PageSnapshotV1 = {
             schemaVersion: 1,
             pageId: DEMO_PAGE_ID,
             contentHash: DEMO_CONTENT_HASH,
             clientRev: st.clientRev,
             demoCounter: demoCounterRef.current,
+            fills: fillsRef.current,
+            paletteIdx: paletteIdxRef.current,
             updatedAtMs: Date.now(),
           };
 
@@ -228,7 +244,6 @@ export default function App() {
       return;
     }
 
-    // Apply current fills (Stage 2: local-only)
     applyFillsToContainer(host, fills);
   }, [fills]);
 
@@ -237,10 +252,9 @@ export default function App() {
   }
 
   /**
-   * Local-first action: advance rev + persist snapshot + enqueue server me/state + schedule batched push.
-   * Stage 2: snapshot does not yet contain fills (progress comes next), but rev stays monotonic.
+   * Local-first action: advance rev + persist snapshot (incl. fills) + enqueue server me/state + schedule batched push.
    */
-  async function advanceLocalRevAndEnqueue(): Promise<void> {
+  async function advanceLocalRevAndEnqueue(nextFills?: FillMap, nextPaletteIdx?: number): Promise<void> {
     const nextRev = clientRevRef.current + 1;
     const nextCounter = demoCounterRef.current + 1;
 
@@ -253,6 +267,8 @@ export default function App() {
       contentHash: DEMO_CONTENT_HASH,
       clientRev: nextRev,
       demoCounter: nextCounter,
+      fills: nextFills ?? fillsRef.current,
+      paletteIdx: typeof nextPaletteIdx === "number" ? nextPaletteIdx : paletteIdxRef.current,
       updatedAtMs: Date.now(),
     };
     await savePageSnapshot(snap);
@@ -299,7 +315,6 @@ export default function App() {
     const host = svgHostRef.current;
     if (!host) return;
 
-    // Clamp coords defensively (viewport coords)
     const x = clampInt(e.clientX, 0, window.innerWidth);
     const y = clampInt(e.clientY, 0, window.innerHeight);
 
@@ -318,16 +333,16 @@ export default function App() {
     // Apply to DOM immediately (responsiveness)
     applyFillToRegion(host, hit.regionId, color);
 
-    // Commit local fill state
-    setFills((prev) => {
-      if (prev[hit.regionId] === color) return prev;
-      return { ...prev, [hit.regionId]: color };
-    });
+    // Compute next fills deterministically (for snapshot correctness).
+    const prev = fillsRef.current;
+    const nextFills: FillMap = prev[hit.regionId] === color ? prev : { ...prev, [hit.regionId]: color };
 
+    // Update React state
+    setFills(nextFills);
     setLastTap(`filled ${hit.regionId} -> ${color}`);
 
-    // Advance revision + enqueue cross-device restore sync
-    await advanceLocalRevAndEnqueue();
+    // Persist local snapshot immediately with nextFills (local-first), then enqueue server sync.
+    await advanceLocalRevAndEnqueue(nextFills, paletteIdxRef.current);
   }
 
   async function resetLocal() {
@@ -340,6 +355,7 @@ export default function App() {
     setLastPageId(null);
     setServerState(null);
     setFills({});
+    setPaletteIdx(0);
     setLastTap("none");
     setOut("idle");
   }
@@ -425,7 +441,7 @@ export default function App() {
           </div>
         </div>
 
-        <button className="t2f-btn" onClick={advanceLocalRevAndEnqueue} style={{ marginTop: 12 }}>
+        <button className="t2f-btn" onClick={() => void advanceLocalRevAndEnqueue()} style={{ marginTop: 12 }}>
           Simulate Local Action (snapshot + enqueue sync)
         </button>
 
@@ -457,8 +473,8 @@ export default function App() {
       </div>
 
       <div className="t2f-footnote" style={{ marginTop: 10 }}>
-        Stage 2: fills are local-only; we sync only (lastPageId, clientRev) for cross-device restore of the user’s last
-        page. Next step: persist fills via page snapshot payload and/or /v1/progress.
+        Stage 2: fills are persisted locally (snapshot). Server sync still includes only (lastPageId, clientRev) for
+        cross-device restore of the last page. Next step: persist fills via page snapshot payload and/or /v1/progress.
       </div>
     </div>
   );
