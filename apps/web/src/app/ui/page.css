@@ -1,0 +1,231 @@
+/* apps/web/src/app/ui/page.css
+ *
+ * Page UI styles:
+ * - Action bar (Undo / Reset / etc.)
+ * - Overlay stacking helpers
+ * - Disabled & focus-visible policies
+ *
+ * Design goals:
+ * - Theme-aware via Telegram CSS variables
+ * - Predictable layering (z-index tokens)
+ * - Accessible focus states
+ * - No global tag selectors (scoped via .t2f-*)
+ */
+
+:root {
+  /* Layering tokens (keep small and consistent) */
+  --t2f-z-actionbar: 20;
+  --t2f-z-overlay: 80;
+
+  /* Spacing / radii */
+  --t2f-r-12: 12px;
+  --t2f-r-16: 16px;
+  --t2f-gap-8: 8px;
+  --t2f-gap-10: 10px;
+  --t2f-gap-12: 12px;
+
+  /* Surfaces */
+  --t2f-surface: color-mix(
+    in srgb,
+    var(--tg-theme-bg-color, #ffffff) 92%,
+    #000 8%
+  );
+  --t2f-surface-2: color-mix(
+    in srgb,
+    var(--tg-theme-bg-color, #ffffff) 86%,
+    #000 14%
+  );
+  --t2f-border: color-mix(
+    in srgb,
+    var(--tg-theme-hint-color, rgba(0, 0, 0, 0.35)) 35%,
+    transparent
+  );
+  --t2f-shadow: 0 14px 40px rgba(0, 0, 0, 0.22);
+
+  /* Text */
+  --t2f-fg: var(--tg-theme-text-color, #111111);
+  --t2f-muted: var(--tg-theme-hint-color, rgba(0, 0, 0, 0.55));
+
+  /* Buttons */
+  --t2f-btn-bg: var(--tg-theme-button-color, #1e90ff);
+  --t2f-btn-fg: var(--tg-theme-button-text-color, #ffffff);
+  --t2f-btn-bg-muted: color-mix(in srgb, var(--t2f-surface-2) 86%, #000 14%);
+  --t2f-btn-fg-muted: var(--t2f-fg);
+
+  /* Focus ring */
+  --t2f-focus: color-mix(
+    in srgb,
+    var(--tg-theme-button-color, #1e90ff) 75%,
+    #fff 25%
+  );
+}
+
+/* ===== Action bar (page controls) ===== */
+
+.t2f-pageBar {
+  position: sticky;
+  top: 0;
+  z-index: var(--t2f-z-actionbar);
+
+  display: flex;
+  align-items: center;
+  gap: var(--t2f-gap-10);
+
+  padding: var(--t2f-gap-10);
+  margin: 0;
+
+  background: color-mix(
+    in srgb,
+    var(--tg-theme-bg-color, #ffffff) 92%,
+    transparent
+  );
+  backdrop-filter: blur(6px);
+
+  border: 1px solid var(--t2f-border);
+  border-radius: var(--t2f-r-16);
+  box-shadow: var(--t2f-shadow);
+}
+
+.t2f-pageBarLeft,
+.t2f-pageBarRight {
+  display: flex;
+  align-items: center;
+  gap: var(--t2f-gap-8);
+}
+
+.t2f-pageBarRight {
+  margin-left: auto;
+}
+
+.t2f-pageBarMeta {
+  font-size: 12px;
+  color: var(--t2f-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: min(48vw, 420px);
+}
+
+/* ===== Buttons ===== */
+
+.t2f-actionBtn {
+  appearance: none;
+  border: 1px solid var(--t2f-border);
+  border-radius: var(--t2f-r-12);
+
+  padding: 10px 12px;
+
+  font: inherit;
+  font-weight: 800;
+  letter-spacing: 0.1px;
+
+  background: var(--t2f-btn-bg-muted);
+  color: var(--t2f-btn-fg-muted);
+
+  cursor: pointer;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+
+  transition: transform 120ms ease, opacity 120ms ease, background 120ms ease,
+    border-color 120ms ease;
+}
+
+.t2f-actionBtn:active {
+  transform: translateY(1px);
+}
+
+.t2f-actionBtnPrimary {
+  background: var(--t2f-btn-bg);
+  color: var(--t2f-btn-fg);
+  border-color: color-mix(in srgb, var(--t2f-btn-bg) 65%, transparent);
+}
+
+.t2f-actionBtnDanger {
+  background: color-mix(in srgb, #ff4757 18%, var(--t2f-btn-bg-muted));
+  color: var(--t2f-fg);
+  border-color: color-mix(in srgb, #ff4757 38%, var(--t2f-border));
+}
+
+.t2f-actionBtn:focus-visible {
+  outline: 2px solid var(--t2f-focus);
+  outline-offset: 2px;
+}
+
+.t2f-actionBtn[disabled],
+.t2f-actionBtnDisabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+  transform: none;
+}
+
+/* Small pill (e.g., counters) */
+.t2f-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+
+  padding: 7px 10px;
+  border-radius: 999px;
+
+  border: 1px solid var(--t2f-border);
+  background: var(--t2f-surface);
+  color: var(--t2f-muted);
+
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.t2f-pill strong {
+  color: var(--t2f-fg);
+  font-weight: 900;
+}
+
+/* ===== Overlay helpers ===== */
+
+.t2f-overlayHost {
+  position: relative;
+}
+
+.t2f-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: var(--t2f-z-overlay);
+
+  display: grid;
+  place-items: center;
+
+  padding: max(env(safe-area-inset-top), 12px)
+    max(env(safe-area-inset-right), 12px) max(env(safe-area-inset-bottom), 12px)
+    max(env(safe-area-inset-left), 12px);
+
+  background: rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(4px);
+}
+
+.t2f-overlayCard {
+  width: min(92vw, 520px);
+  border-radius: var(--t2f-r-16);
+  border: 1px solid var(--t2f-border);
+
+  background: var(--tg-theme-bg-color, #ffffff);
+  color: var(--t2f-fg);
+
+  box-shadow: 0 22px 52px rgba(0, 0, 0, 0.35);
+  overflow: hidden;
+}
+
+/* Prevent scroll chaining behind modals/overlays on mobile */
+.t2f-overlay,
+.t2f-overlayCard {
+  overscroll-behavior: none;
+}
+
+/* ===== Reduced motion ===== */
+@media (prefers-reduced-motion: reduce) {
+  .t2f-actionBtn {
+    transition: none;
+  }
+  .t2f-actionBtn:active {
+    transform: none;
+  }
+}

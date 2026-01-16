@@ -1,0 +1,97 @@
+/* apps/web/src/app/viewport/zoomPan.css
+ *
+ * Stage 3 — Zoom/Pan (P0)
+ * Baseline CSS for the pan/zoom container and its content.
+ *
+ * Principles:
+ * - Disable browser-native panning/zooming inside the container (touch-action: none)
+ * - Prevent scroll chaining/bounce (overscroll-behavior: none)
+ * - Provide predictable cursor feedback (grab/grabbing)
+ * - Keep transforms performant (will-change)
+ *
+ * Usage:
+ * - Apply .zp-container to the element that receives pointer events (the "container" you pass to attachZoomPan()).
+ * - Apply .zp-content to the element you transform (SVG host, canvas, etc.).
+ */
+
+.zp-container {
+  position: relative;
+  width: 100%;
+  height: 100%;
+
+  /* Required for custom gestures */
+  touch-action: none;
+
+  /* Prevent scroll chaining (esp. iOS/Android webviews) */
+  overscroll-behavior: none;
+
+  /* Avoid text selection during gestures */
+  user-select: none;
+  -webkit-user-select: none;
+
+  /* Prevent long-press context menu on mobile */
+  -webkit-touch-callout: none;
+
+  /* Better tap responsiveness */
+  -webkit-tap-highlight-color: transparent;
+
+  /* Keep gestures self-contained */
+  overflow: hidden;
+
+  /* Optional: preserve momentum outside (if any parent scroll exists) */
+  scrollbar-gutter: stable both-edges;
+}
+
+/* Cursor feedback for desktop */
+.zp-container {
+  cursor: grab;
+}
+.zp-container.zp-gesturing {
+  cursor: grabbing;
+}
+
+/* Transformed content wrapper */
+.zp-content {
+  position: absolute;
+  inset: 0;
+
+  /* Let the container receive events; content is transformed, not interacted with directly */
+  pointer-events: none;
+
+  /* Performance hint: translate+scale on every frame */
+  will-change: transform;
+  transform-origin: 0 0;
+}
+
+/* When you want the content itself to accept clicks (e.g., SVG regions),
+   you can override pointer-events on specific descendants in your SVG policy.
+   The wrapper remains pointer-events:none; region selectors inside SVG can still be pointer-events:all.
+*/
+
+/* If you render a <canvas> for future stages */
+.zp-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+
+  /* canvas is drawn content, not a text/image; prevent selection */
+  user-select: none;
+  -webkit-user-select: none;
+
+  /* Keep rendering crisp when scaled in CSS (optional; you may prefer auto) */
+  image-rendering: auto;
+}
+
+/* Optional: make SVG fill the content box by default */
+.zp-content svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+/* Prefer reduced motion: no special animations here, but keep the hook for future easing */
+@media (prefers-reduced-motion: reduce) {
+  .zp-content {
+    will-change: auto;
+  }
+}

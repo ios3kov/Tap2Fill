@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-01-16T00:00:00.000Z",
+  "defaultPageId": "page_demo_1",
+  "defaultPageLimit": 12,
+  "pages": [
+    {
+      "id": "page_demo_1",
+      "title": "Demo Page",
+      "slug": "demoPage",
+      "thumbUrl": "/thumbs/demoPage.webp",
+      "svgRawImportKey": "demoPage.svg",
+      "regionsCount": 4,
+      "contentHash": "demo_hash_v1",
+      "palette": [
+        "#111827",
+        "#EF4444",
+        "#F59E0B",
+        "#10B981",
+        "#3B82F6",
+        "#A855F7"
+      ]
+    }
+  ]
+}

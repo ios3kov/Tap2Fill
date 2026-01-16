@@ -109,7 +109,7 @@
 .t2f-pre {
   padding: 10px;
   border-radius: 12px;
-  background: rgba(127, 127, 127, 0.10);
+  background: rgba(127, 127, 127, 0.1);
   overflow: auto;
 }
 

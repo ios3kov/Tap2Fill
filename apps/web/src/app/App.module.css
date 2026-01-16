@@ -1,7 +1,8 @@
 .app {
   min-height: 100dvh;
   padding: 16px;
-  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto,
+    Helvetica, Arial;
 }
 
 .header {
@@ -64,7 +65,7 @@
   margin-top: 12px;
   padding: 10px;
   border-radius: 12px;
-  background: rgba(127, 127, 127, 0.10);
+  background: rgba(127, 127, 127, 0.1);
   overflow: auto;
   font-size: 12px;
   line-height: 1.35;

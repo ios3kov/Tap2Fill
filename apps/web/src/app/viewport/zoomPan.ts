@@ -1,0 +1,520 @@
+// apps/web/src/app/viewport/zoomPan.ts
+/**
+ * Stage 3 — Zoom/Pan (P0)
+ *
+ * Thin, dependency-free zoom/pan controller for a single "content" element inside a container.
+ * - Pointer events (mouse/touch/pen) + wheel zoom.
+ * - Pinch-to-zoom (2 pointers) + pan.
+ * - Reports transform and gesture state:
+ *    attach(container, { onTransform, onGestureState }) -> { destroy, getState, setState, reset }
+ *
+ * Security / safety:
+ * - No DOM injection, no eval, no global listeners beyond what we register.
+ * - Clamps scale; hard caps internal loops; robust pointer bookkeeping.
+ *
+ * Notes:
+ * - This controller applies transforms via callback only. You decide how to render (CSS transform, canvas, etc).
+ * - Intended usage: container contains a content element (e.g., SVG host) you transform.
+ */
+
+export type Transform = {
+  /** Translation in CSS pixels (screen space). */
+  tx: number
+  ty: number
+  /** Uniform scale. */
+  scale: number
+}
+
+export type GestureState = {
+  /** True while user is actively panning or pinching (pointer-based). */
+  isGesturing: boolean
+  /** True while pinch (2 pointers) is active. */
+  isPinching: boolean
+  /** True while a wheel-zoom interaction is happening (short-lived). */
+  isWheelZooming: boolean
+}
+
+export type ZoomPanOptions = {
+  /** Minimum allowed scale. Default 1. */
+  minScale?: number
+  /** Maximum allowed scale. Default 6. */
+  maxScale?: number
+
+  /**
+   * Wheel zoom speed. Positive values. Default 0.0015.
+   * Effective factor: scale *= exp(-deltaY * wheelZoomSpeed)
+   */
+  wheelZoomSpeed?: number
+
+  /** Whether to enable wheel zoom. Default true. */
+  enableWheelZoom?: boolean
+
+  /**
+   * Gesture end debounce (ms). Used to keep isGesturing true briefly after last movement,
+   * helping UI avoid flicker. Default 80ms.
+   */
+  gestureEndDebounceMs?: number
+
+  /**
+   * If true (default), we call setPointerCapture on pointerdown and release on end.
+   * Improves tracking outside bounds.
+   */
+  usePointerCapture?: boolean
+
+  /**
+   * If true (default), prevents default browser behavior for touch/pointers where safe.
+   * You should also set CSS `touch-action: none;` on the container.
+   */
+  preventDefault?: boolean
+
+  /**
+   * When true (default), zoom is centered around pointer position / pinch centroid.
+   */
+  zoomToPoint?: boolean
+}
+
+export type AttachArgs = {
+  onTransform: (t: Transform) => void
+  onGestureState?: (s: GestureState) => void
+  initial?: Partial<Transform>
+  options?: ZoomPanOptions
+}
+
+export type ZoomPanController = {
+  destroy: () => void
+  /** Current internal state. */
+  getState: () => { transform: Transform; gesture: GestureState }
+  /** Programmatically set transform (clamped). */
+  setState: (t: Partial<Transform>) => void
+  /** Reset to identity (scale=1, tx=0, ty=0). */
+  reset: () => void
+}
+
+const DEFAULTS: Required<ZoomPanOptions> = {
+  minScale: 1,
+  maxScale: 6,
+  wheelZoomSpeed: 0.0015,
+  enableWheelZoom: true,
+  gestureEndDebounceMs: 80,
+  usePointerCapture: true,
+  preventDefault: true,
+  zoomToPoint: true,
+}
+
+function clamp(n: number, a: number, b: number): number {
+  return Math.max(a, Math.min(b, n))
+}
+
+function isFiniteNumber(n: unknown): n is number {
+  return typeof n === "number" && Number.isFinite(n)
+}
+
+type PointerInfo = {
+  id: number
+  x: number
+  y: number
+}
+
+function computeCentroid(
+  a: PointerInfo,
+  b: PointerInfo,
+): { x: number; y: number } {
+  return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }
+}
+
+function dist(a: PointerInfo, b: PointerInfo): number {
+  const dx = a.x - b.x
+  const dy = a.y - b.y
+  return Math.sqrt(dx * dx + dy * dy)
+}
+
+/**
+ * Attach zoom/pan controller to a container element.
+ */
+export function attachZoomPan(
+  container: HTMLElement,
+  args: AttachArgs,
+): ZoomPanController {
+  const opts: Required<ZoomPanOptions> = {
+    ...DEFAULTS,
+    ...(args.options ?? {}),
+  }
+
+  const t: Transform = {
+    tx: isFiniteNumber(args.initial?.tx) ? args.initial!.tx! : 0,
+    ty: isFiniteNumber(args.initial?.ty) ? args.initial!.ty! : 0,
+    scale: clamp(
+      isFiniteNumber(args.initial?.scale) ? args.initial!.scale! : 1,
+      opts.minScale,
+      opts.maxScale,
+    ),
+  }
+
+  const g: GestureState = {
+    isGesturing: false,
+    isPinching: false,
+    isWheelZooming: false,
+  }
+
+  const pointers = new Map<number, PointerInfo>()
+
+  // For pan (single pointer)
+  let panStartX = 0
+  let panStartY = 0
+  let panStartTx = 0
+  let panStartTy = 0
+
+  // For pinch
+  let pinchStartDist = 1
+  let pinchStartScale = 1
+  let pinchStartTx = 0
+  let pinchStartTy = 0
+  let pinchAnchorX = 0 // in client coordinates
+  let pinchAnchorY = 0
+
+  // Gesture end debounce
+  let gestureOffTimer: number | null = null
+
+  // Wheel debounce (so UI can treat it as gesturing if desired)
+  let wheelOffTimer: number | null = null
+
+  // Throttle transform emissions (rAF)
+  let rafId: number | null = null
+  let pendingEmit = false
+
+  function emitTransform(): void {
+    args.onTransform({ ...t })
+  }
+
+  function emitGesture(): void {
+    args.onGestureState?.({ ...g })
+  }
+
+  function scheduleEmit(): void {
+    if (pendingEmit) return
+    pendingEmit = true
+    rafId = window.requestAnimationFrame(() => {
+      pendingEmit = false
+      emitTransform()
+    })
+  }
+
+  function setGesturing(on: boolean): void {
+    if (g.isGesturing === on) return
+    g.isGesturing = on
+    emitGesture()
+  }
+
+  function setPinching(on: boolean): void {
+    if (g.isPinching === on) return
+    g.isPinching = on
+    emitGesture()
+  }
+
+  function setWheelZooming(on: boolean): void {
+    if (g.isWheelZooming === on) return
+    g.isWheelZooming = on
+    emitGesture()
+  }
+
+  function clearTimer(ref: number | null): void {
+    if (ref !== null) window.clearTimeout(ref)
+  }
+
+  function scheduleGestureOff(): void {
+    clearTimer(gestureOffTimer)
+    gestureOffTimer = window.setTimeout(
+      () => {
+        gestureOffTimer = null
+        // Only end gesture if no active pointers
+        if (pointers.size === 0) {
+          setPinching(false)
+          setGesturing(false)
+        }
+      },
+      Math.max(0, Math.trunc(opts.gestureEndDebounceMs)),
+    )
+  }
+
+  function scheduleWheelOff(): void {
+    clearTimer(wheelOffTimer)
+    wheelOffTimer = window.setTimeout(() => {
+      wheelOffTimer = null
+      setWheelZooming(false)
+      // Do not toggle isGesturing here; wheel is considered "non-pointer" gesture.
+      // If you want unified gating, the caller can treat isWheelZooming as gesturing.
+    }, 120)
+  }
+
+  function containerRect(): DOMRect {
+    return container.getBoundingClientRect()
+  }
+
+  /**
+   * Zoom around a client-space anchor point, keeping that point stable visually.
+   */
+  function zoomAboutPoint(
+    nextScale: number,
+    anchorClientX: number,
+    anchorClientY: number,
+  ): void {
+    const clampedScale = clamp(nextScale, opts.minScale, opts.maxScale)
+    if (clampedScale === t.scale) return
+
+    if (!opts.zoomToPoint) {
+      t.scale = clampedScale
+      scheduleEmit()
+      return
+    }
+
+    // Convert anchor from client coords to container-local coords
+    const r = containerRect()
+    const ax = anchorClientX - r.left
+    const ay = anchorClientY - r.top
+
+    // We maintain: screen = (content * scale) + translation.
+    // When changing scale, update translation so the anchor stays stable:
+    // newTx = ax - (ax - tx) * (newScale/oldScale)
+    const ratio = clampedScale / t.scale
+    t.tx = ax - (ax - t.tx) * ratio
+    t.ty = ay - (ay - t.ty) * ratio
+    t.scale = clampedScale
+
+    scheduleEmit()
+  }
+
+  function onPointerDown(ev: PointerEvent): void {
+    if (opts.preventDefault) ev.preventDefault()
+
+    if (opts.usePointerCapture) {
+      try {
+        container.setPointerCapture(ev.pointerId)
+      } catch {
+        // ignore (some browsers may throw)
+      }
+    }
+
+    pointers.set(ev.pointerId, {
+      id: ev.pointerId,
+      x: ev.clientX,
+      y: ev.clientY,
+    })
+
+    // Start gesture
+    setGesturing(true)
+
+    if (pointers.size === 1) {
+      // Begin pan
+      panStartX = ev.clientX
+      panStartY = ev.clientY
+      panStartTx = t.tx
+      panStartTy = t.ty
+      setPinching(false)
+    } else if (pointers.size === 2) {
+      // Begin pinch
+      const [a, b] = Array.from(pointers.values())
+      pinchStartDist = Math.max(1, dist(a, b))
+      pinchStartScale = t.scale
+      pinchStartTx = t.tx
+      pinchStartTy = t.ty
+
+      const c = computeCentroid(a, b)
+      pinchAnchorX = c.x
+      pinchAnchorY = c.y
+
+      setPinching(true)
+    } else {
+      // Ignore 3+ pointers (defense-in-depth); keep gesturing true.
+      // We still track pointers so that releasing returns to normal.
+    }
+  }
+
+  function onPointerMove(ev: PointerEvent): void {
+    const p = pointers.get(ev.pointerId)
+    if (!p) return
+    if (opts.preventDefault) ev.preventDefault()
+
+    // Update pointer coordinates
+    p.x = ev.clientX
+    p.y = ev.clientY
+
+    if (pointers.size === 1) {
+      // Pan
+      const dx = ev.clientX - panStartX
+      const dy = ev.clientY - panStartY
+      t.tx = panStartTx + dx
+      t.ty = panStartTy + dy
+      scheduleEmit()
+      scheduleGestureOff() // keep on while moving; will turn off after debounce
+      return
+    }
+
+    if (pointers.size === 2) {
+      const [a, b] = Array.from(pointers.values())
+      const d = Math.max(1, dist(a, b))
+      const nextScale = clamp(
+        (d / pinchStartDist) * pinchStartScale,
+        opts.minScale,
+        opts.maxScale,
+      )
+
+      // Use the live centroid as anchor (more stable than fixed start anchor)
+      const c = computeCentroid(a, b)
+      pinchAnchorX = c.x
+      pinchAnchorY = c.y
+
+      // Apply zoom about centroid, but base translation on the pinch start values to reduce drift.
+      // We compute zoom from pinchStartScale; to do that, temporarily restore start translation+scale.
+      const prevScale = t.scale
+      const prevTx = t.tx
+      const prevTy = t.ty
+
+      t.scale = pinchStartScale
+      t.tx = pinchStartTx
+      t.ty = pinchStartTy
+
+      zoomAboutPoint(nextScale, pinchAnchorX, pinchAnchorY)
+
+      // If zoomAboutPoint short-circuited (scale unchanged), restore prior values.
+      if (t.scale === pinchStartScale && nextScale === pinchStartScale) {
+        t.scale = prevScale
+        t.tx = prevTx
+        t.ty = prevTy
+      }
+
+      scheduleEmit()
+      scheduleGestureOff()
+      setPinching(true)
+      return
+    }
+
+    // 3+ pointers: no-op, but keep gesture alive
+    scheduleGestureOff()
+  }
+
+  function onPointerUpOrCancel(ev: PointerEvent): void {
+    if (opts.preventDefault) ev.preventDefault()
+
+    pointers.delete(ev.pointerId)
+
+    if (opts.usePointerCapture) {
+      try {
+        container.releasePointerCapture(ev.pointerId)
+      } catch {
+        // ignore
+      }
+    }
+
+    if (pointers.size === 0) {
+      // End gesture after debounce
+      scheduleGestureOff()
+      return
+    }
+
+    if (pointers.size === 1) {
+      // Switch to pan with the remaining pointer
+      const [rem] = Array.from(pointers.values())
+      panStartX = rem.x
+      panStartY = rem.y
+      panStartTx = t.tx
+      panStartTy = t.ty
+      setPinching(false)
+      scheduleGestureOff()
+      return
+    }
+
+    if (pointers.size === 2) {
+      // Reinitialize pinch from current state
+      const [a, b] = Array.from(pointers.values())
+      pinchStartDist = Math.max(1, dist(a, b))
+      pinchStartScale = t.scale
+      pinchStartTx = t.tx
+      pinchStartTy = t.ty
+
+      const c = computeCentroid(a, b)
+      pinchAnchorX = c.x
+      pinchAnchorY = c.y
+
+      setPinching(true)
+      scheduleGestureOff()
+    }
+  }
+
+  function onWheel(ev: WheelEvent): void {
+    if (!opts.enableWheelZoom) return
+
+    // If ctrlKey is pressed on some browsers, wheel may mean "pinch" on trackpad.
+    // We treat both the same: zoom.
+    if (opts.preventDefault) ev.preventDefault()
+
+    const dy = ev.deltaY
+    if (!isFiniteNumber(dy) || dy === 0) return
+
+    // Exponential feels natural and stable across devices.
+    const factor = Math.exp(-dy * opts.wheelZoomSpeed)
+    const nextScale = t.scale * factor
+
+    setWheelZooming(true)
+    scheduleWheelOff()
+
+    // Anchor at pointer location (client coords)
+    zoomAboutPoint(nextScale, ev.clientX, ev.clientY)
+  }
+
+  // Heuristic: avoid breaking native scroll when the container is not intended for pan/zoom
+  // Caller should set CSS touch-action:none; we still register non-passive to be able to preventDefault.
+  const peOpts: AddEventListenerOptions = { passive: !opts.preventDefault }
+  const wheelOpts: AddEventListenerOptions = { passive: false }
+
+  container.addEventListener("pointerdown", onPointerDown, peOpts)
+  container.addEventListener("pointermove", onPointerMove, peOpts)
+  container.addEventListener("pointerup", onPointerUpOrCancel, peOpts)
+  container.addEventListener("pointercancel", onPointerUpOrCancel, peOpts)
+  container.addEventListener("wheel", onWheel, wheelOpts)
+
+  // Initial emit so UI has state
+  emitTransform()
+  emitGesture()
+
+  return {
+    destroy() {
+      container.removeEventListener("pointerdown", onPointerDown)
+      container.removeEventListener("pointermove", onPointerMove)
+      container.removeEventListener("pointerup", onPointerUpOrCancel)
+      container.removeEventListener("pointercancel", onPointerUpOrCancel)
+      container.removeEventListener("wheel", onWheel)
+
+      clearTimer(gestureOffTimer)
+      clearTimer(wheelOffTimer)
+
+      if (rafId !== null) {
+        window.cancelAnimationFrame(rafId)
+        rafId = null
+      }
+
+      pointers.clear()
+      setPinching(false)
+      setWheelZooming(false)
+      setGesturing(false)
+    },
+
+    getState() {
+      return { transform: { ...t }, gesture: { ...g } }
+    },
+
+    setState(next: Partial<Transform>) {
+      if (isFiniteNumber(next.tx)) t.tx = next.tx
+      if (isFiniteNumber(next.ty)) t.ty = next.ty
+      if (isFiniteNumber(next.scale))
+        t.scale = clamp(next.scale, opts.minScale, opts.maxScale)
+      scheduleEmit()
+    },
+
+    reset() {
+      t.tx = 0
+      t.ty = 0
+      t.scale = clamp(1, opts.minScale, opts.maxScale)
+      scheduleEmit()
+    },
+  }
+}

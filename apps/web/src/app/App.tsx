@@ -1,366 +1,812 @@
 // apps/web/src/app/App.tsx
-import { useEffect, useMemo, useRef, useState } from "react";
-import { getInitData, isTma, tmaBootstrap } from "../lib/tma";
-import { getMeState, putMeState, type MeState, hasTelegramInitData } from "../lib/api";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { getInitData, isTma, tmaBootstrap } from "../lib/tma"
+import {
+  getMeState,
+  putMeState,
+  type MeState,
+  hasTelegramInitData,
+} from "../lib/api"
 import {
   deletePageSnapshot,
   loadLastPageId,
   loadPageSnapshot,
   saveLastPageId,
   savePageSnapshot,
-  type PageSnapshotV1,
-} from "../local/snapshot";
-import { clearPendingMeState, enqueueMeState, loadPendingMeState } from "../local/outbox";
+  type PageSnapshotV2,
+} from "../local/snapshot"
+import {
+  clearPendingMeState,
+  enqueueMeState,
+  loadPendingMeState,
+} from "../local/outbox"
 
-import demoSvg from "./demoPage.svg?raw";
-import { DEFAULT_PALETTE, applyFillsToContainer, safeColorIndex, type FillMap } from "./coloring";
-import { applyFillToRegion, hitTestRegionAtPoint, mountSvgIntoHost, type MountResult } from "./svgTapToFill";
+import demoSvg from "./demoPage.svg?raw"
+import {
+  DEFAULT_PALETTE,
+  applyFillsToContainer,
+  safeColorIndex,
+  type FillMap,
+} from "./coloring"
+import {
+  applyFillToRegion,
+  hitTestRegionAtPoint,
+  mountSvgIntoHost,
+  type MountResult,
+} from "./svgTapToFill"
 
-import "./svgTapToFill.css";
+import { attachZoomPan, type ZoomPanTransform } from "./viewport/zoomPan"
+import "./viewport/zoomPan.css"
 
-const DEMO_PAGE_ID = "page_demo_1";
-const DEMO_CONTENT_HASH = "demo_hash_v1";
+import { Gallery } from "./ui/Gallery"
+import "./ui/gallery.css"
 
-/**
- * Stage 2 (Happy Path) – One page tap-to-fill
- * Goals:
- *  - TMA bootstrap + safe-area sizing
- *  - SVG contract: viewBox + data-region + outline pointer-events off (via css + mount)
- *  - Hardened hit test: elementFromPoint -> climb to [data-region]
- *  - Local-first: apply fill instantly; persist fills locally; advance clientRev; snapshot; enqueue me/state; batched sync
- */
+import { ConfirmModal } from "./ui/ConfirmModal"
+import { CompletionReward } from "./ui/CompletionReward"
+import "./ui/page.css"
+
+import { decodeProgressB64ToFillMap } from "./progress/pack"
+
+import "./svgTapToFill.css"
+
+type Route = { name: "gallery" } | { name: "page"; pageId: string }
+
+const DEMO_PAGE_ID = "page_demo_1"
+const DEMO_CONTENT_HASH = "demo_hash_v1"
+
+// Demo page metadata (Stage 3: static; later comes from catalog/API)
+const DEMO_REGIONS_COUNT = 240 // must match actual page
+const DEMO_PALETTE: readonly string[] = DEFAULT_PALETTE
+
+// Undo policy (Stage 3)
+const UNDO_BUDGET_PER_SESSION = 5
+
+type UnknownRecord = Record<string, unknown>
+
+function asRecord(v: unknown): UnknownRecord | null {
+  return v && typeof v === "object" ? (v as UnknownRecord) : null
+}
 
 function safeJson(x: unknown): string {
   try {
-    return JSON.stringify(x);
+    return JSON.stringify(x)
   } catch {
-    return String(x);
+    return String(x)
   }
 }
 
 function clampInt(n: number, min: number, max: number): number {
-  if (!Number.isFinite(n)) return min;
-  return Math.max(min, Math.min(max, Math.trunc(n)));
+  if (!Number.isFinite(n)) return min
+  return Math.max(min, Math.min(max, Math.trunc(n)))
+}
+
+function applyTransformStyle(el: HTMLElement, t: ZoomPanTransform): void {
+  el.style.transform = `translate3d(${t.tx}px, ${t.ty}px, 0) scale(${t.scale})`
+}
+
+function normalizePageId(pageId: unknown): string | null {
+  const s = typeof pageId === "string" ? pageId.trim() : ""
+  if (!s) return null
+  if (s.length > 64) return null
+  if (!/^[a-zA-Z0-9:_-]+$/.test(s)) return null
+  return s
+}
+
+function isFiniteNonNegativeInt(v: unknown): v is number {
+  return (
+    typeof v === "number" && Number.isFinite(v) && v >= 0 && Number.isInteger(v)
+  )
+}
+
+function clampNonNegativeInt(v: unknown, fallback = 0): number {
+  return isFiniteNonNegativeInt(v) ? v : fallback
+}
+
+function safeArrayOfStrings(v: unknown, maxLen = 1000): string[] {
+  if (!Array.isArray(v)) return []
+  const out: string[] = []
+  for (const x of v) {
+    if (out.length >= maxLen) break
+    if (typeof x === "string" && x.trim()) out.push(x.trim())
+  }
+  return out
+}
+
+function sanitizeFillMap(input: unknown, maxEntries = 20000): FillMap {
+  const rec = asRecord(input)
+  if (!rec) return {}
+  const out: FillMap = {}
+  let n = 0
+  for (const [k, v] of Object.entries(rec)) {
+    if (n >= maxEntries) break
+    if (typeof k !== "string" || k.length === 0 || k.length > 64) continue
+    if (typeof v !== "string" || v.length === 0 || v.length > 64) continue
+    // Only allow regionId-like keys (we use R### pattern in demo)
+    if (!/^R\d{3}$/.test(k)) continue
+    out[k] = v
+    n++
+  }
+  return out
+}
+
+/**
+ * Snapshot helpers
+ * - We store BOTH a FillMap (fast UI apply) and packed progressB64 (future-proof for API).
+ * - Until regionIndex mapping is wired, packed progress is "best effort" but preserved for forward compatibility.
+ */
+function buildSnapshot(params: {
+  clientRev: number
+  demoCounter: number
+  pageId: string
+  contentHash: string
+  paletteIdx: number
+  fills: FillMap
+  progressB64: string
+  regionsCount: number
+  paletteLen: number
+  undoStackB64: string[]
+  undoUsed: number
+}): PageSnapshotV2 {
+  return {
+    schemaVersion: 2,
+    pageId: params.pageId,
+    contentHash: params.contentHash,
+    clientRev: clampNonNegativeInt(params.clientRev, 0),
+    demoCounter: clampNonNegativeInt(params.demoCounter, 0),
+    paletteIdx: clampNonNegativeInt(params.paletteIdx, 0),
+
+    fills: params.fills,
+    progressB64: String(params.progressB64 ?? ""),
+    regionsCount: clampNonNegativeInt(params.regionsCount, 0),
+    paletteLen: clampNonNegativeInt(params.paletteLen, 0),
+
+    undoStackB64: safeArrayOfStrings(params.undoStackB64, 64),
+    undoBudgetUsed: clampNonNegativeInt(params.undoUsed, 0),
+
+    updatedAtMs: Date.now(),
+  }
 }
 
 export default function App() {
-  const [out, setOut] = useState("idle");
-  const [tick, setTick] = useState(0);
+  const [out, setOut] = useState("idle")
+  const [tick, setTick] = useState(0)
+
+  // Routing
+  const [route, setRoute] = useState<Route>({ name: "gallery" })
 
   // Local-first state
-  const [clientRev, setClientRev] = useState(0);
-  const [demoCounter, setDemoCounter] = useState(0);
-  const [lastPageId, setLastPageId] = useState<string | null>(null);
+  const [clientRev, setClientRev] = useState(0)
+  const [demoCounter, setDemoCounter] = useState(0)
+  const [lastPageId, setLastPageId] = useState<string | null>(null)
 
   // Visibility: server
-  const [serverState, setServerState] = useState<MeState | null>(null);
+  const [serverState, setServerState] = useState<MeState | null>(null)
 
-  // Stage 2: coloring UI state (LOCAL-FIRST persisted)
-  const [paletteIdx, setPaletteIdx] = useState(0);
-  const [fills, setFills] = useState<FillMap>({});
-  const [lastTap, setLastTap] = useState<string>("none");
+  // Coloring UI state (LOCAL-FIRST persisted)
+  const [paletteIdx, setPaletteIdx] = useState(0)
+  const [fills, setFills] = useState<FillMap>({})
+  const [lastTap, setLastTap] = useState<string>("none")
 
-  const svgHostRef = useRef<HTMLDivElement | null>(null);
+  // Packed progress (forward compatible storage)
+  const [progressB64, setProgressB64] = useState<string>("")
+  const progressB64Ref = useRef<string>("")
+
+  // Undo (stack of packed progress snapshots)
+  const [undoStackB64, setUndoStackB64] = useState<string[]>([])
+  const [undoBudgetUsed, setUndoBudgetUsed] = useState(0)
+
+  // Zoom/Pan state
+  const [transform, setTransform] = useState<ZoomPanTransform>({
+    scale: 1,
+    tx: 0,
+    ty: 0,
+  })
+  const [isGesturing, setIsGesturing] = useState(false)
+
+  // Page UX: confirm + reward overlay
+  const [confirmResetOpen, setConfirmResetOpen] = useState(false)
+  const [rewardOpen, setRewardOpen] = useState(false)
+  const rewardDismissedRef = useRef(false)
+
+  const svgHostRef = useRef<HTMLDivElement | null>(null)
+  const zoomContainerRef = useRef<HTMLDivElement | null>(null)
+  const zoomContentRef = useRef<HTMLDivElement | null>(null)
 
   // Batched sync refs
-  const flushTimerRef = useRef<number | null>(null);
-  const flushingRef = useRef(false);
+  const flushTimerRef = useRef<number | null>(null)
+  const flushingRef = useRef(false)
 
   // Stable refs for async flows
-  const clientRevRef = useRef(0);
-  const demoCounterRef = useRef(0);
-  const paletteIdxRef = useRef(0);
-  const fillsRef = useRef<FillMap>({});
+  const clientRevRef = useRef(0)
+  const demoCounterRef = useRef(0)
+  const paletteIdxRef = useRef(0)
+  const fillsRef = useRef<FillMap>({})
+  const undoStackRef = useRef<string[]>([])
+  const undoUsedRef = useRef(0)
+  const isGesturingRef = useRef(false)
 
   useEffect(() => {
-    clientRevRef.current = clientRev;
-  }, [clientRev]);
+    clientRevRef.current = clientRev
+  }, [clientRev])
 
   useEffect(() => {
-    demoCounterRef.current = demoCounter;
-  }, [demoCounter]);
+    demoCounterRef.current = demoCounter
+  }, [demoCounter])
 
   useEffect(() => {
-    paletteIdxRef.current = paletteIdx;
-  }, [paletteIdx]);
+    paletteIdxRef.current = paletteIdx
+  }, [paletteIdx])
 
   useEffect(() => {
-    fillsRef.current = fills;
-  }, [fills]);
+    fillsRef.current = fills
+  }, [fills])
 
   useEffect(() => {
-    const cleanup = tmaBootstrap();
+    progressB64Ref.current = progressB64
+  }, [progressB64])
 
-    // Small tick window: for initData length label without re-rendering forever
-    const id = window.setInterval(() => setTick((t) => t + 1), 250);
-    window.setTimeout(() => window.clearInterval(id), 3000);
+  useEffect(() => {
+    undoStackRef.current = undoStackB64
+  }, [undoStackB64])
+
+  useEffect(() => {
+    undoUsedRef.current = undoBudgetUsed
+  }, [undoBudgetUsed])
+
+  useEffect(() => {
+    isGesturingRef.current = isGesturing
+  }, [isGesturing])
+
+  useEffect(() => {
+    const cleanup = tmaBootstrap()
+
+    const id = window.setInterval(() => setTick((t) => t + 1), 250)
+    window.setTimeout(() => window.clearInterval(id), 3000)
 
     return () => {
-      window.clearInterval(id);
-      cleanup?.();
-    };
-  }, []);
+      window.clearInterval(id)
+      cleanup?.()
+    }
+  }, [])
 
-  const initDataLen = useMemo(() => getInitData().length, [tick]);
-  const runtimeLabel = isTma() ? "Telegram Mini App" : "Web (standalone)";
-  const canCallServer = hasTelegramInitData();
+  // tick is used purely to force re-render during first seconds; we just read initData directly.
+  void tick
+  const initDataLen = getInitData().length
 
-  // Restore local snapshots (no network)
+  const runtimeLabel = isTma() ? "Telegram Mini App" : "Web (standalone)"
+  const canCallServer = hasTelegramInitData()
+
+  const persistSnapshotNow = useCallback(
+    async (params: {
+      nextClientRev: number
+      nextDemoCounter: number
+      nextPaletteIdx: number
+      nextFills: FillMap
+      nextProgressB64: string
+      nextUndoStackB64: string[]
+      nextUndoUsed: number
+    }): Promise<void> => {
+      const snap = buildSnapshot({
+        clientRev: params.nextClientRev,
+        demoCounter: params.nextDemoCounter,
+        pageId: DEMO_PAGE_ID,
+        contentHash: DEMO_CONTENT_HASH,
+        paletteIdx: params.nextPaletteIdx,
+        fills: params.nextFills,
+        progressB64: params.nextProgressB64,
+        regionsCount: DEMO_REGIONS_COUNT,
+        paletteLen: DEMO_PALETTE.length,
+        undoStackB64: params.nextUndoStackB64,
+        undoUsed: params.nextUndoUsed,
+      })
+      await savePageSnapshot(snap)
+    },
+    [],
+  )
+
+  // Restore local snapshot (no network) + route restore.
   useEffect(() => {
-    let cancelled = false;
+    let cancelled = false
+    ;(async () => {
+      const lp = await loadLastPageId()
+      const snap = await loadPageSnapshot(DEMO_PAGE_ID, DEMO_CONTENT_HASH)
 
-    (async () => {
-      const lp = await loadLastPageId();
-      const snap = await loadPageSnapshot(DEMO_PAGE_ID, DEMO_CONTENT_HASH);
+      if (cancelled) return
 
-      if (cancelled) return;
-
-      setLastPageId(lp);
+      const normalizedLp = normalizePageId(lp)
+      setLastPageId(normalizedLp)
+      if (normalizedLp) setRoute({ name: "page", pageId: normalizedLp })
 
       if (snap) {
-        setClientRev(snap.clientRev);
-        setDemoCounter(snap.demoCounter);
+        setClientRev(clampNonNegativeInt(snap.clientRev, 0))
+        setDemoCounter(clampNonNegativeInt(snap.demoCounter, 0))
 
-        // Stage 2: restore fills + palette
-        if (snap.fills) setFills(snap.fills);
-        if (typeof snap.paletteIdx === "number") setPaletteIdx(safeColorIndex(snap.paletteIdx));
+        const nextPalette =
+          typeof snap.paletteIdx === "number"
+            ? safeColorIndex(snap.paletteIdx)
+            : 0
+        setPaletteIdx(nextPalette)
+
+        const rec = asRecord(snap)
+
+        const nextUndoStack = safeArrayOfStrings(rec?.undoStackB64, 64)
+        const nextUndoUsed = clampNonNegativeInt(rec?.undoBudgetUsed, 0)
+        setUndoStackB64(nextUndoStack)
+        setUndoBudgetUsed(nextUndoUsed)
+
+        const packed =
+          typeof rec?.progressB64 === "string" ? rec.progressB64.trim() : ""
+        const rc = clampNonNegativeInt(rec?.regionsCount, 0)
+        const pl = clampNonNegativeInt(rec?.paletteLen, 0)
+
+        if (packed && rc > 0 && pl > 0) {
+          setProgressB64(packed)
+
+          const decodedFills = decodeProgressB64ToFillMap(
+            packed,
+            rc,
+            pl,
+            DEMO_PALETTE,
+          )
+          setFills(decodedFills)
+        } else {
+          // Legacy or partially migrated snapshot: fall back to fills if present.
+          const legacy = sanitizeFillMap(rec?.fills)
+          setFills(legacy)
+          setProgressB64("")
+        }
       }
-    })();
+    })()
 
     return () => {
-      cancelled = true;
-    };
-  }, []);
+      cancelled = true
+    }
+  }, [])
 
-  /**
-   * Server restore (pull on start):
-   * If server.clientRev > local.clientRev -> apply locally.
-   *
-   * NOTE: Stage 2 stores fills locally only.
-   * Server restore updates rev/lastPageId; fills remain from local snapshot.
-   */
+  // Server restore (me/state includes only lastPageId/clientRev)
   useEffect(() => {
-    let cancelled = false;
-
-    (async () => {
-      if (!canCallServer) return;
+    let cancelled = false
+    ;(async () => {
+      if (!canCallServer) return
 
       try {
-        const res = await getMeState();
-        if (cancelled) return;
+        const res = await getMeState()
+        if (cancelled) return
 
-        setServerState(res.state);
+        setServerState(res.state)
 
-        const st = res.state;
-        if (!st) return;
+        const st = res.state
+        if (!st) return
 
+        const normalized = normalizePageId(st.lastPageId)
+
+        if (!lastPageId && normalized) {
+          setLastPageId(normalized)
+          setRoute({ name: "page", pageId: normalized })
+          await saveLastPageId(normalized)
+        }
+
+        // Keep local rev monotonic w.r.t server (idempotency)
         if (st.clientRev > clientRevRef.current) {
-          setClientRev(st.clientRev);
-          setLastPageId(st.lastPageId);
+          const nextClientRev = st.clientRev
+          setClientRev(nextClientRev)
 
-          // Persist server-ahead rev locally without touching fills.
-          const snap: PageSnapshotV1 = {
-            schemaVersion: 1,
-            pageId: DEMO_PAGE_ID,
-            contentHash: DEMO_CONTENT_HASH,
-            clientRev: st.clientRev,
-            demoCounter: demoCounterRef.current,
-            fills: fillsRef.current,
-            paletteIdx: paletteIdxRef.current,
-            updatedAtMs: Date.now(),
-          };
-
-          await savePageSnapshot(snap);
-          await saveLastPageId(st.lastPageId);
+          await persistSnapshotNow({
+            nextClientRev,
+            nextDemoCounter: demoCounterRef.current,
+            nextPaletteIdx: paletteIdxRef.current,
+            nextFills: fillsRef.current,
+            nextProgressB64: progressB64Ref.current,
+            nextUndoStackB64: undoStackRef.current,
+            nextUndoUsed: undoUsedRef.current,
+          })
         }
       } catch (e) {
-        setOut((prev) => (prev === "idle" ? `WARN: server restore failed: ${(e as Error).message}` : prev));
+        setOut((prev) =>
+          prev === "idle"
+            ? `WARN: server restore failed: ${(e as Error).message}`
+            : prev,
+        )
       }
-    })();
+    })()
 
     return () => {
-      cancelled = true;
-    };
-  }, [canCallServer]);
+      cancelled = true
+    }
+    // Intentionally keep lastPageId out: server restore should not re-run on local page changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canCallServer, persistSnapshotNow])
 
-  async function flushOutboxOnce(): Promise<void> {
-    if (!canCallServer) return;
-    if (flushingRef.current) return;
+  const flushOutboxOnce = useCallback(async (): Promise<void> => {
+    if (!canCallServer) return
+    if (flushingRef.current) return
 
-    const pending = await loadPendingMeState();
-    if (!pending) return;
+    const pending = await loadPendingMeState()
+    if (!pending) return
 
-    flushingRef.current = true;
+    flushingRef.current = true
     try {
-      const res = await putMeState({ lastPageId: pending.lastPageId, clientRev: pending.clientRev });
-      setServerState(res.state);
+      const res = await putMeState({
+        lastPageId: pending.lastPageId,
+        clientRev: pending.clientRev,
+      })
+      setServerState(res.state)
 
-      // Clear if server acknowledged >= our rev
       if (res.state && res.state.clientRev >= pending.clientRev) {
-        await clearPendingMeState();
+        await clearPendingMeState()
       }
     } catch {
       // keep pending; retry later
     } finally {
-      flushingRef.current = false;
+      flushingRef.current = false
     }
-  }
+  }, [canCallServer])
 
-  async function scheduleFlush(delayMs: number): Promise<void> {
-    if (!canCallServer) return;
+  const scheduleFlush = useCallback(
+    async (delayMs: number): Promise<void> => {
+      if (!canCallServer) return
 
-    if (flushTimerRef.current !== null) {
-      window.clearTimeout(flushTimerRef.current);
-      flushTimerRef.current = null;
-    }
+      if (flushTimerRef.current !== null) {
+        window.clearTimeout(flushTimerRef.current)
+        flushTimerRef.current = null
+      }
 
-    flushTimerRef.current = window.setTimeout(() => {
-      flushTimerRef.current = null;
-      void flushOutboxOnce();
-    }, Math.max(0, Math.trunc(delayMs)));
-  }
+      flushTimerRef.current = window.setTimeout(
+        () => {
+          flushTimerRef.current = null
+          void flushOutboxOnce()
+        },
+        Math.max(0, Math.trunc(delayMs)),
+      )
+    },
+    [canCallServer, flushOutboxOnce],
+  )
 
-  // On boot: attempt to flush pending outbox (best-effort).
   useEffect(() => {
-    if (!canCallServer) return;
-    void flushOutboxOnce();
-  }, [canCallServer]);
+    if (!canCallServer) return
+    void flushOutboxOnce()
+  }, [canCallServer, flushOutboxOnce])
 
-  // ===== Stage 2: SVG mount (contract + sanitize + root attrs) + apply fills =====
+  // ===== SVG mount + apply fills (only when on page route) =====
   useEffect(() => {
-    const host = svgHostRef.current;
-    if (!host) return;
+    if (route.name !== "page") return
+
+    const host = svgHostRef.current
+    if (!host) return
 
     const res: MountResult = mountSvgIntoHost(host, demoSvg, {
       requireViewBox: true,
       requireRegionIdPattern: true,
       regionIdPattern: /^R\d{3}$/,
       sanitize: true,
-    });
+    })
 
     if (!res.ok) {
-      setOut((prev) => (prev === "idle" ? `ERR: ${res.reason}` : prev));
-      host.replaceChildren();
-      return;
+      setOut((prev) => (prev === "idle" ? `ERR: ${res.reason}` : prev))
+      host.replaceChildren()
+      return
     }
 
-    applyFillsToContainer(host, fills);
-  }, [fills]);
+    applyFillsToContainer(host, fills)
+  }, [route.name, fills])
+
+  // ===== Zoom/Pan attach (only when on page route) =====
+  useEffect(() => {
+    if (route.name !== "page") return
+
+    const container = zoomContainerRef.current
+    const content = zoomContentRef.current
+    if (!container || !content) return
+
+    applyTransformStyle(content, transform)
+
+    const detach = attachZoomPan(container, {
+      onTransform: (t) => {
+        applyTransformStyle(content, t)
+        setTransform(t)
+      },
+      onGestureState: (s) => {
+        setIsGesturing(s.isGesturing)
+        if (s.isGesturing) container.classList.add("zp-gesturing")
+        else container.classList.remove("zp-gesturing")
+      },
+    })
+
+    return () => {
+      detach()
+      container.classList.remove("zp-gesturing")
+    }
+    // transform is applied imperatively; avoid reattaching for each transform tick.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [route.name])
 
   function activeColor(): string {
-    return DEFAULT_PALETTE[safeColorIndex(paletteIdx)];
+    return DEMO_PALETTE[safeColorIndex(paletteIdx, DEMO_PALETTE)]
   }
 
-  /**
-   * Local-first action: advance rev + persist snapshot (incl. fills) + enqueue server me/state + schedule batched push.
-   */
-  async function advanceLocalRevAndEnqueue(nextFills?: FillMap, nextPaletteIdx?: number): Promise<void> {
-    const nextRev = clientRevRef.current + 1;
-    const nextCounter = demoCounterRef.current + 1;
+  async function commitLocalMutation(params: {
+    nextFills: FillMap
+    nextProgressB64: string
+    nextPaletteIdx: number
+    nextUndoStackB64: string[]
+    nextUndoUsed: number
+    tapLabel: string
+  }): Promise<void> {
+    const nextClientRev = clientRevRef.current + 1
+    const nextDemoCounter = demoCounterRef.current + 1
 
-    setClientRev(nextRev);
-    setDemoCounter(nextCounter);
+    setClientRev(nextClientRev)
+    setDemoCounter(nextDemoCounter)
+    setFills(params.nextFills)
+    setProgressB64(params.nextProgressB64)
+    setPaletteIdx(params.nextPaletteIdx)
+    setUndoStackB64(params.nextUndoStackB64)
+    setUndoBudgetUsed(params.nextUndoUsed)
+    setLastTap(params.tapLabel)
 
-    const snap: PageSnapshotV1 = {
-      schemaVersion: 1,
-      pageId: DEMO_PAGE_ID,
-      contentHash: DEMO_CONTENT_HASH,
-      clientRev: nextRev,
-      demoCounter: nextCounter,
-      fills: nextFills ?? fillsRef.current,
-      paletteIdx: typeof nextPaletteIdx === "number" ? nextPaletteIdx : paletteIdxRef.current,
-      updatedAtMs: Date.now(),
-    };
-    await savePageSnapshot(snap);
+    await persistSnapshotNow({
+      nextClientRev,
+      nextDemoCounter,
+      nextPaletteIdx: params.nextPaletteIdx,
+      nextFills: params.nextFills,
+      nextProgressB64: params.nextProgressB64,
+      nextUndoStackB64: params.nextUndoStackB64,
+      nextUndoUsed: params.nextUndoUsed,
+    })
 
-    const newLast = DEMO_PAGE_ID;
-    setLastPageId(newLast);
-    await saveLastPageId(newLast);
+    setLastPageId(DEMO_PAGE_ID)
+    await saveLastPageId(DEMO_PAGE_ID)
 
-    await enqueueMeState(newLast, nextRev);
-    await scheduleFlush(600);
+    await enqueueMeState(DEMO_PAGE_ID, nextClientRev)
+    await scheduleFlush(600)
   }
 
-  async function runSmokePutState() {
-    setOut("calling...");
-    try {
-      const res = await putMeState({ lastPageId: DEMO_PAGE_ID, clientRev });
-      setServerState(res.state);
-      setOut(`OK: ${safeJson(res)}`);
-    } catch (e) {
-      setOut(`ERR: ${(e as Error).message}`);
-    }
-  }
-
-  async function testIdempotencySameClientRev() {
-    setOut("calling same clientRev...");
-    const fixedRev = clientRev; // DO NOT increase
-    try {
-      const a = await putMeState({ lastPageId: "page_A", clientRev: fixedRev });
-      const b = await putMeState({ lastPageId: "page_B", clientRev: fixedRev });
-      setServerState(b.state);
-
-      setOut(
-        `OK:\n1) ${safeJson(a)}\n2) ${safeJson(b)}\n\nEXPECTED: lastPageId remains "page_A" after second call`,
-      );
-    } catch (e) {
-      setOut(`ERR: ${(e as Error).message}`);
-    }
-  }
-
-  // ===== Stage 2: tap-to-fill handler =====
+  // ===== Tap-to-fill handler (blocked during gesture) =====
   async function onPointerDown(e: React.PointerEvent) {
-    if (e.button !== 0) return;
+    if (isGesturingRef.current) return
+    if (typeof e.button === "number" && e.button !== 0) return
 
-    const host = svgHostRef.current;
-    if (!host) return;
+    const host = svgHostRef.current
+    if (!host) return
 
-    const x = clampInt(e.clientX, 0, window.innerWidth);
-    const y = clampInt(e.clientY, 0, window.innerHeight);
+    const x = clampInt(e.clientX, 0, window.innerWidth)
+    const y = clampInt(e.clientY, 0, window.innerHeight)
 
     const hit = hitTestRegionAtPoint(x, y, {
       requireRegionIdPattern: true,
       regionIdPattern: /^R\d{3}$/,
-    });
+    })
 
     if (!hit) {
-      setLastTap("tap: no region");
-      return;
+      setLastTap("tap: no region")
+      return
     }
 
-    const color = activeColor();
+    const color = activeColor()
+    applyFillToRegion(host, hit.regionId, color)
 
-    // Apply to DOM immediately (responsiveness)
-    applyFillToRegion(host, hit.regionId, color);
+    const prev = fillsRef.current
+    const nextFills: FillMap =
+      prev[hit.regionId] === color ? prev : { ...prev, [hit.regionId]: color }
 
-    // Compute next fills deterministically (for snapshot correctness).
-    const prev = fillsRef.current;
-    const nextFills: FillMap = prev[hit.regionId] === color ? prev : { ...prev, [hit.regionId]: color };
+    // Until regionIndex mapping exists, preserve packed progress as-is.
+    const nextProgressB64 = progressB64Ref.current
 
-    // Update React state
-    setFills(nextFills);
-    setLastTap(`filled ${hit.regionId} -> ${color}`);
+    // Undo: push previous packed state if available.
+    const prevUndo = undoStackRef.current
+    const prevPacked = progressB64Ref.current
+    const nextUndoStack = prevPacked
+      ? [...prevUndo, prevPacked].slice(-64)
+      : prevUndo
 
-    // Persist local snapshot immediately with nextFills (local-first), then enqueue server sync.
-    await advanceLocalRevAndEnqueue(nextFills, paletteIdxRef.current);
+    await commitLocalMutation({
+      nextFills,
+      nextProgressB64,
+      nextPaletteIdx: paletteIdxRef.current,
+      nextUndoStackB64: nextUndoStack,
+      nextUndoUsed: undoUsedRef.current, // budget is consumed by undo, not by fill
+      tapLabel: `filled ${hit.regionId} -> ${color}`,
+    })
   }
 
-  async function resetLocal() {
-    await deletePageSnapshot(DEMO_PAGE_ID, DEMO_CONTENT_HASH);
-    await saveLastPageId(null);
-    await clearPendingMeState();
-
-    setClientRev(0);
-    setDemoCounter(0);
-    setLastPageId(null);
-    setServerState(null);
-    setFills({});
-    setPaletteIdx(0);
-    setLastTap("none");
-    setOut("idle");
+  function goGallery(): void {
+    setRoute({ name: "gallery" })
   }
 
-  const canDebugServer = canCallServer;
+  async function openPage(pageId: string): Promise<void> {
+    const id = normalizePageId(pageId)
+    if (!id) return
+
+    rewardDismissedRef.current = false
+    setRewardOpen(false)
+
+    setRoute({ name: "page", pageId: id })
+    setLastPageId(id)
+    await saveLastPageId(id)
+  }
+
+  async function continueFlow(): Promise<void> {
+    if (lastPageId) {
+      await openPage(lastPageId)
+      return
+    }
+    await openPage(DEMO_PAGE_ID)
+  }
+
+  async function hardResetAllLocal(): Promise<void> {
+    await deletePageSnapshot(DEMO_PAGE_ID, DEMO_CONTENT_HASH)
+    await saveLastPageId(null)
+    await clearPendingMeState()
+
+    rewardDismissedRef.current = false
+    setRewardOpen(false)
+
+    setClientRev(0)
+    setDemoCounter(0)
+    setLastPageId(null)
+    setServerState(null)
+    setFills({})
+    setProgressB64("")
+    setPaletteIdx(0)
+    setUndoStackB64([])
+    setUndoBudgetUsed(0)
+    setLastTap("none")
+    setOut("idle")
+
+    const t: ZoomPanTransform = { scale: 1, tx: 0, ty: 0 }
+    setTransform(t)
+    const content = zoomContentRef.current
+    if (content) applyTransformStyle(content, t)
+
+    setRoute({ name: "gallery" })
+
+    await persistSnapshotNow({
+      nextClientRev: 0,
+      nextDemoCounter: 0,
+      nextPaletteIdx: 0,
+      nextFills: {},
+      nextProgressB64: "",
+      nextUndoStackB64: [],
+      nextUndoUsed: 0,
+    })
+  }
+
+  // ===== Page Reset (Start Over) =====
+  async function startOverPageConfirmed(): Promise<void> {
+    setConfirmResetOpen(false)
+    setRewardOpen(false)
+    rewardDismissedRef.current = false
+
+    // Reset progress but keep session undo budget used (hard per-session policy).
+    const nextUndoUsed = undoUsedRef.current
+
+    const nextFills: FillMap = {}
+    const nextProgress = ""
+    const nextUndoStack: string[] = []
+
+    const t: ZoomPanTransform = { scale: 1, tx: 0, ty: 0 }
+    setTransform(t)
+    const content = zoomContentRef.current
+    if (content) applyTransformStyle(content, t)
+
+    const host = svgHostRef.current
+    if (host) applyFillsToContainer(host, nextFills)
+
+    await commitLocalMutation({
+      nextFills,
+      nextProgressB64: nextProgress,
+      nextPaletteIdx: 0,
+      nextUndoStackB64: nextUndoStack,
+      nextUndoUsed,
+      tapLabel: "reset: start over",
+    })
+  }
+
+  // ===== Undo (budgeted) =====
+  const undoLeft = useMemo(
+    () =>
+      Math.max(
+        0,
+        UNDO_BUDGET_PER_SESSION - clampNonNegativeInt(undoBudgetUsed, 0),
+      ),
+    [undoBudgetUsed],
+  )
+
+  const canUndo = useMemo(
+    () => undoLeft > 0 && undoStackB64.length > 0,
+    [undoLeft, undoStackB64.length],
+  )
+
+  async function undoOneBudgeted(): Promise<void> {
+    if (!canUndo) return
+
+    const stack = undoStackRef.current
+    if (stack.length <= 0) return
+
+    const prevPacked = stack[stack.length - 1]
+    const nextStack = stack.slice(0, -1)
+    const nextUsed = clampNonNegativeInt(undoUsedRef.current, 0) + 1
+
+    let nextFills: FillMap = {}
+    try {
+      nextFills = decodeProgressB64ToFillMap(
+        prevPacked,
+        DEMO_REGIONS_COUNT,
+        DEMO_PALETTE.length,
+        DEMO_PALETTE,
+      )
+    } catch {
+      nextFills = {}
+    }
+
+    const host = svgHostRef.current
+    if (host) applyFillsToContainer(host, nextFills)
+
+    await commitLocalMutation({
+      nextFills,
+      nextProgressB64: prevPacked,
+      nextPaletteIdx: paletteIdxRef.current,
+      nextUndoStackB64: nextStack,
+      nextUndoUsed: nextUsed,
+      tapLabel: "undo",
+    })
+  }
+
+  async function runSmokePutState() {
+    setOut("calling...")
+    try {
+      const res = await putMeState({ lastPageId: DEMO_PAGE_ID, clientRev })
+      setServerState(res.state)
+      setOut(`OK: ${safeJson(res)}`)
+    } catch (e) {
+      setOut(`ERR: ${(e as Error).message}`)
+    }
+  }
+
+  async function testIdempotencySameClientRev() {
+    setOut("calling same clientRev...")
+    const fixedRev = clientRev
+    try {
+      const a = await putMeState({ lastPageId: "page_A", clientRev: fixedRev })
+      const b = await putMeState({ lastPageId: "page_B", clientRev: fixedRev })
+      setServerState(b.state)
+
+      setOut(
+        `OK:\n1) ${safeJson(a)}\n2) ${safeJson(b)}\n\nEXPECTED: lastPageId remains "page_A" after second call`,
+      )
+    } catch (e) {
+      setOut(`ERR: ${(e as Error).message}`)
+    }
+  }
+
+  const canDebugServer = canCallServer
+
+  const percent = useMemo(() => {
+    return Math.min(
+      100,
+      Math.round(
+        (Object.keys(fills).length / Math.max(1, DEMO_REGIONS_COUNT)) * 100,
+      ),
+    )
+  }, [fills])
+
+  const completed = useMemo(() => {
+    return Object.keys(fills).length >= DEMO_REGIONS_COUNT
+  }, [fills])
+
+  // Completion detector -> reward overlay
+  useEffect(() => {
+    if (route.name !== "page") return
+    if (!completed) return
+    if (rewardDismissedRef.current) return
+
+    setRewardOpen(true)
+  }, [completed, route.name])
+
+  function dismissReward(): void {
+    rewardDismissedRef.current = true
+    setRewardOpen(false)
+  }
 
   return (
     <div
@@ -369,113 +815,251 @@ export default function App() {
         padding:
           "max(env(safe-area-inset-top), 12px) max(env(safe-area-inset-right), 12px) max(env(safe-area-inset-bottom), 12px) max(env(safe-area-inset-left), 12px)",
         fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial",
+        background: "var(--tg-theme-bg-color, transparent)",
       }}
     >
-      <h1 style={{ margin: 0 }}>Tap2Fill</h1>
-      <p style={{ opacity: 0.7, marginTop: 6 }}>Local-first + server restore + batched sync + tap-to-fill</p>
-
-      {/* Stage 2: Coloring surface */}
-      <div className="t2f-card" style={{ marginTop: 12 }}>
-        <div className="t2f-row">
-          <span>Runtime</span>
-          <strong>{runtimeLabel}</strong>
+      <div
+        style={{
+          display: "flex",
+          alignItems: "baseline",
+          justifyContent: "space-between",
+          gap: 12,
+        }}
+      >
+        <h1 style={{ margin: 0 }}>Tap2Fill</h1>
+        <div style={{ fontSize: 12, opacity: 0.7 }}>
+          {runtimeLabel} · initData {initDataLen}
         </div>
+      </div>
 
-        <div className="t2f-row t2f-rowMuted" style={{ marginTop: 8 }}>
-          <span>initData length</span>
-          <strong>{initDataLen}</strong>
+      {route.name === "gallery" && (
+        <div style={{ marginTop: 10 }}>
+          <Gallery
+            onOpen={(id) => void openPage(id)}
+            onContinue={() => void continueFlow()}
+            continuePageId={lastPageId}
+          />
+
+          <div className="t2f-card" style={{ marginTop: 12 }}>
+            <div className="t2f-panel">
+              <div className="t2f-row">
+                <span>Local lastPageId</span>
+                <strong>{lastPageId ?? "null"}</strong>
+              </div>
+              <div className="t2f-row" style={{ marginTop: 6 }}>
+                <span>Local clientRev</span>
+                <strong>{clientRev}</strong>
+              </div>
+            </div>
+
+            <button
+              className="t2f-btn"
+              onClick={() => void hardResetAllLocal()}
+              style={{ marginTop: 12 }}
+            >
+              Reset Local Snapshot
+            </button>
+          </div>
         </div>
+      )}
 
-        <div className="t2f-palette" style={{ marginTop: 12 }}>
-          {DEFAULT_PALETTE.map((c, idx) => {
-            const active = idx === safeColorIndex(paletteIdx);
-            return (
+      {route.name === "page" && (
+        <div style={{ marginTop: 12 }}>
+          <div className="t2f-pageBar">
+            <div className="t2f-pageBarLeft">
+              <button className="t2f-actionBtn" onClick={goGallery}>
+                Back
+              </button>
+            </div>
+
+            <div className="t2f-pageBarRight">
+              <span className="t2f-pageBarMeta">
+                Page <strong>{route.pageId}</strong> · {percent}%{" "}
+                {completed ? "· Completed" : ""} · Undo left{" "}
+                <strong>{undoLeft}</strong>
+              </span>
+
               <button
-                key={c}
-                onClick={() => setPaletteIdx(idx)}
-                className={active ? "t2f-swatch t2f-swatchActive" : "t2f-swatch"}
-                style={{ background: c }}
-                aria-label={`color ${c}`}
-              />
-            );
-          })}
-          <span className="t2f-activeColor">
-            Active: <strong>{activeColor()}</strong>
-          </span>
-        </div>
+                className="t2f-actionBtn"
+                disabled={!canUndo}
+                onClick={() => void undoOneBudgeted()}
+                aria-disabled={!canUndo}
+                title={
+                  !canUndo
+                    ? "Undo unavailable (no history or budget exhausted)"
+                    : "Undo"
+                }
+              >
+                Undo
+              </button>
 
-        <div className="t2f-canvas" onPointerDown={onPointerDown} style={{ marginTop: 12 }}>
-          <div ref={svgHostRef} className="t2f-svgHost" />
-        </div>
-
-        <div className="t2f-meta" style={{ marginTop: 10 }}>
-          Last tap: <strong>{lastTap}</strong> · Filled: <strong>{Object.keys(fills).length}</strong>
-        </div>
-      </div>
-
-      {/* Debug panel (kept) */}
-      <div className="t2f-card" style={{ marginTop: 12 }}>
-        <div className="t2f-panel">
-          <div className="t2f-row">
-            <span>Local lastPageId</span>
-            <strong>{lastPageId ?? "null"}</strong>
+              <button
+                className="t2f-actionBtn t2f-actionBtnDanger"
+                onClick={() => setConfirmResetOpen(true)}
+              >
+                Start Over
+              </button>
+            </div>
           </div>
-          <div className="t2f-row" style={{ marginTop: 6 }}>
-            <span>Local clientRev</span>
-            <strong>{clientRev}</strong>
+
+          {/* Palette */}
+          <div className="t2f-card" style={{ marginTop: 12 }}>
+            <div className="t2f-panel">
+              <div className="t2f-palette">
+                {DEMO_PALETTE.map((c, idx) => {
+                  const active =
+                    idx === safeColorIndex(paletteIdx, DEMO_PALETTE)
+                  return (
+                    <button
+                      key={c}
+                      onClick={() => void setPaletteIdx(idx)}
+                      className={
+                        active ? "t2f-swatch t2f-swatchActive" : "t2f-swatch"
+                      }
+                      style={{ background: c }}
+                      aria-label={`color ${c}`}
+                    />
+                  )
+                })}
+                <span className="t2f-activeColor">
+                  Active: <strong>{activeColor()}</strong>
+                </span>
+              </div>
+            </div>
           </div>
-          <div className="t2f-row" style={{ marginTop: 6 }}>
-            <span>Local demoCounter</span>
-            <strong>{demoCounter}</strong>
+
+          {/* Zoom/Pan + Canvas */}
+          <div
+            ref={zoomContainerRef}
+            className="t2f-canvas zp-container t2f-overlayHost"
+            onPointerDown={onPointerDown}
+            style={{ marginTop: 12, height: 520 }}
+            aria-label="Coloring canvas"
+          >
+            <div ref={zoomContentRef} className="zp-content">
+              <div ref={svgHostRef} className="t2f-svgHost" />
+            </div>
+          </div>
+
+          <div className="t2f-meta" style={{ marginTop: 10 }}>
+            Last action: <strong>{lastTap}</strong> · Filled:{" "}
+            <strong>{Object.keys(fills).length}</strong>
+            <span style={{ marginLeft: 10, opacity: 0.75 }}>
+              · Gesture: <strong>{isGesturing ? "active" : "idle"}</strong> ·
+              Transform:{" "}
+              <strong>{`s=${transform.scale.toFixed(2)} tx=${Math.round(transform.tx)} ty=${Math.round(
+                transform.ty,
+              )}`}</strong>
+            </span>
+          </div>
+
+          <ConfirmModal
+            open={confirmResetOpen}
+            title="Start over?"
+            message="This will clear all fills on this page. This cannot be undone once confirmed."
+            confirmText="Start Over"
+            cancelText="Cancel"
+            danger
+            onConfirm={() => void startOverPageConfirmed()}
+            onCancel={() => setConfirmResetOpen(false)}
+          />
+
+          <CompletionReward
+            open={rewardOpen}
+            percent={percent}
+            onClose={dismissReward}
+            onBack={() => {
+              dismissReward()
+              goGallery()
+            }}
+            onNext={() => {
+              dismissReward()
+              goGallery()
+            }}
+          />
+
+          {/* Debug panel (kept) */}
+          <div className="t2f-card" style={{ marginTop: 12 }}>
+            <div className="t2f-panel">
+              <div className="t2f-row">
+                <span>Local lastPageId</span>
+                <strong>{lastPageId ?? "null"}</strong>
+              </div>
+              <div className="t2f-row" style={{ marginTop: 6 }}>
+                <span>Local clientRev</span>
+                <strong>{clientRev}</strong>
+              </div>
+              <div className="t2f-row" style={{ marginTop: 6 }}>
+                <span>Local demoCounter</span>
+                <strong>{demoCounter}</strong>
+              </div>
+              <div className="t2f-row" style={{ marginTop: 6 }}>
+                <span>Local progressB64</span>
+                <strong>
+                  {progressB64 ? `${progressB64.length} chars` : "empty"}
+                </strong>
+              </div>
+              <div className="t2f-row" style={{ marginTop: 6 }}>
+                <span>Undo stack</span>
+                <strong>{undoStackB64.length}</strong>
+              </div>
+              <div className="t2f-row" style={{ marginTop: 6 }}>
+                <span>Undo used</span>
+                <strong>{undoBudgetUsed}</strong>
+              </div>
+            </div>
+
+            <div className="t2f-panel t2f-panelAlt" style={{ marginTop: 12 }}>
+              <div className="t2f-row">
+                <span>Server lastPageId</span>
+                <strong>{serverState?.lastPageId ?? "null"}</strong>
+              </div>
+              <div className="t2f-row" style={{ marginTop: 6 }}>
+                <span>Server clientRev</span>
+                <strong>{serverState?.clientRev ?? 0}</strong>
+              </div>
+            </div>
+
+            <button
+              className="t2f-btn"
+              onClick={() => void scheduleFlush(0)}
+              style={{ marginTop: 12 }}
+            >
+              Flush Outbox Now
+            </button>
+
+            <button
+              className="t2f-btn"
+              onClick={testIdempotencySameClientRev}
+              disabled={!canDebugServer}
+              style={{ marginTop: 10, opacity: !canDebugServer ? 0.5 : 0.9 }}
+            >
+              Test Idempotency (same clientRev)
+            </button>
+
+            <button
+              className="t2f-btn"
+              onClick={runSmokePutState}
+              disabled={!canDebugServer}
+              style={{ marginTop: 10, opacity: !canDebugServer ? 0.5 : 1 }}
+            >
+              Run Smoke Test (PUT /v1/me/state)
+            </button>
+
+            <button
+              className="t2f-btn"
+              onClick={() => void hardResetAllLocal()}
+              style={{ marginTop: 10, opacity: 0.9 }}
+            >
+              Reset Local Snapshot
+            </button>
+
+            <pre className="t2f-pre" style={{ marginTop: 12 }}>
+              {out}
+            </pre>
           </div>
         </div>
-
-        <div className="t2f-panel t2f-panelAlt" style={{ marginTop: 12 }}>
-          <div className="t2f-row">
-            <span>Server lastPageId</span>
-            <strong>{serverState?.lastPageId ?? "null"}</strong>
-          </div>
-          <div className="t2f-row" style={{ marginTop: 6 }}>
-            <span>Server clientRev</span>
-            <strong>{serverState?.clientRev ?? 0}</strong>
-          </div>
-        </div>
-
-        <button className="t2f-btn" onClick={() => void advanceLocalRevAndEnqueue()} style={{ marginTop: 12 }}>
-          Simulate Local Action (snapshot + enqueue sync)
-        </button>
-
-        <button
-          className="t2f-btn"
-          onClick={testIdempotencySameClientRev}
-          disabled={!canDebugServer}
-          style={{ marginTop: 10, opacity: !canDebugServer ? 0.5 : 0.9 }}
-        >
-          Test Idempotency (same clientRev)
-        </button>
-
-        <button
-          className="t2f-btn"
-          onClick={runSmokePutState}
-          disabled={!canDebugServer}
-          style={{ marginTop: 10, opacity: !canDebugServer ? 0.5 : 1 }}
-        >
-          Run Smoke Test (PUT /v1/me/state)
-        </button>
-
-        <button className="t2f-btn" onClick={resetLocal} style={{ marginTop: 10, opacity: 0.9 }}>
-          Reset Local Snapshot
-        </button>
-
-        <pre className="t2f-pre" style={{ marginTop: 12 }}>
-          {out}
-        </pre>
-      </div>
-
-      <div className="t2f-footnote" style={{ marginTop: 10 }}>
-        Stage 2: fills are persisted locally (snapshot). Server sync still includes only (lastPageId, clientRev) for
-        cross-device restore of the last page. Next step: persist fills via page snapshot payload and/or /v1/progress.
-      </div>
+      )}
     </div>
-  );
+  )
 }
