@@ -1,25 +1,10 @@
-// apps/web/src/app/hooks/useTapToFillHandlers.ts
 import { useCallback, useEffect, useRef } from "react"
 import type React from "react"
 import { APP_CONFIG } from "../config/appConfig"
 import type { FillMap } from "../coloring"
-import { applyFillToRegion, hitTestRegionAtPoint } from "../svgTapToFill"
 import { clampInt } from "../domain/guards"
-
-/**
- * Stage-3 progress encoding: JSON FillMap -> standard base64 (NOT base64url).
- *
- * Rationale:
- * - Many decoders (atob/Buffer) assume standard base64 with '+' '/' and '=' padding.
- * - base64url requires decoder cooperation; if mismatched, you typically get empty/failed decode,
- *   which looks like "reset" on undo/restore.
- *
- * Payload is ASCII-safe (region ids + hex colors), so btoa is safe here.
- */
-function encodeProgressB64FromFillMap(fills: FillMap): string {
-  const json = JSON.stringify(fills ?? {})
-  return window.btoa(json)
-}
+import { encodeBytesToBase64, packFillMapToBytes } from "../progress/pack"
+import { applyFillToRegion, hitTestRegionAtPoint } from "../svgTapToFill"
 
 export function useTapToFillHandlers(params: {
   enabled: boolean
@@ -30,6 +15,10 @@ export function useTapToFillHandlers(params: {
   fillsRef: React.MutableRefObject<FillMap>
   progressB64Ref: React.MutableRefObject<string>
   paletteIdxRef: React.MutableRefObject<number>
+
+  // Canonical packing inputs (Stage 3)
+  regionOrder: readonly string[]
+  palette: readonly string[]
 
   // Pure getter
   activeColor: () => string
@@ -54,6 +43,8 @@ export function useTapToFillHandlers(params: {
     fillsRef,
     progressB64Ref,
     paletteIdxRef,
+    regionOrder,
+    palette,
     activeColor,
     pushUndoSnapshot,
     commit,
@@ -72,7 +63,7 @@ export function useTapToFillHandlers(params: {
     (e: React.PointerEvent) => {
       if (!enabled) return
       if (e.pointerType !== "touch") return
-      // no-op: onPointerUp handles cleanup and validation
+      // no-op; cleanup happens in onPointerUp
     },
     [enabled],
   )
@@ -103,10 +94,7 @@ export function useTapToFillHandlers(params: {
       const touchPid = isTouch ? e.pointerId : null
 
       try {
-        // Ignore if zoom/pan gesture is active.
         if (isGesturingRef.current) return
-
-        // Only primary button for mouse/pen.
         if (!isTouch && typeof e.button === "number" && e.button !== 0) return
 
         const x = clampInt(e.clientX, 0, window.innerWidth)
@@ -114,16 +102,12 @@ export function useTapToFillHandlers(params: {
 
         if (isTouch) {
           if (!e.isPrimary) return
-
-          // Multi-touch = zoom/pan; do not treat as tap.
           if (activeTouchIdsRef.current.size >= 2) return
 
-          // Debounce to avoid accidental taps at the end of a gesture.
           await new Promise<void>((resolve) =>
             window.setTimeout(resolve, APP_CONFIG.ui.pointer.touchDebounceMs),
           )
 
-          // If pointer got canceled or another finger joined during debounce.
           if (!activeTouchIdsRef.current.has(e.pointerId)) return
           if (activeTouchIdsRef.current.size >= 2) return
           if (isGesturingRef.current) return
@@ -138,7 +122,7 @@ export function useTapToFillHandlers(params: {
         })
 
         if (!hit) {
-          // No region; do not mutate history.
+          // No region hit; no history mutation.
           await commit({
             nextFills: fillsRef.current,
             nextProgressB64: progressB64Ref.current,
@@ -152,11 +136,10 @@ export function useTapToFillHandlers(params: {
         const prevFills = fillsRef.current
         const prevColor = prevFills[hit.regionId]
 
-        // No-op tap (already same color) -> do nothing (no undo, no commit, no rev bump).
+        // No-op tap: do nothing (no undo, no commit).
         if (prevColor === color) return
 
-        // Snapshot BEFORE mutation (for undo).
-        // IMPORTANT: empty string is a valid "blank page" snapshot.
+        // Snapshot BEFORE mutation (undo must restore previous packed progress).
         pushUndoSnapshot(String(progressB64Ref.current ?? ""))
 
         // Apply to DOM immediately for perceived responsiveness.
@@ -164,8 +147,13 @@ export function useTapToFillHandlers(params: {
 
         const nextFills: FillMap = { ...prevFills, [hit.regionId]: color }
 
-        // Recompute packed progress from nextFills (Stage 3).
-        const nextProgressB64 = encodeProgressB64FromFillMap(nextFills)
+        // Canonical Stage-3 packing: FillMap -> bytes -> base64
+        const nextBytes = packFillMapToBytes(nextFills, regionOrder, palette, {
+          // strict enough to be safe, resilient to minor content diffs
+          ignoreUnknownRegions: true,
+          ignoreUnknownColors: true,
+        })
+        const nextProgressB64 = encodeBytesToBase64(nextBytes)
 
         await commit({
           nextFills,
@@ -184,6 +172,8 @@ export function useTapToFillHandlers(params: {
       fillsRef,
       progressB64Ref,
       paletteIdxRef,
+      regionOrder,
+      palette,
       activeColor,
       pushUndoSnapshot,
       commit,

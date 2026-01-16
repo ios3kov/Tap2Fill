@@ -299,6 +299,8 @@ export default function App() {
     fillsRef,
     progressB64Ref,
     paletteIdxRef,
+    regionOrder: DEMO_REGION_ORDER,
+    palette: DEMO_PALETTE,
     activeColor,
     pushUndoSnapshot: history.pushSnapshot,
     commit,
