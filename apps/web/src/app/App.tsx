@@ -320,7 +320,6 @@ export default function App() {
 
   async function hardResetAllLocal(): Promise<void> {
     await deletePageSnapshot(DEMO_PAGE_ID, DEMO_CONTENT_HASH)
-    // outbox clearing intentionally not imported here; keep current behavior minimal.
 
     setRewardDismissed(false)
 
