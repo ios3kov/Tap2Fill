@@ -1,22 +1,17 @@
 /* apps/web/src/app/svgTapToFill.css
  *
- * Stage 3 — SVG Tap-to-Fill pointer policy + minimal UI primitives.
+ * Stage 2 — SVG Tap-to-Fill pointer policy + minimal UI primitives.
  *
  * Contract:
- * - Root SVG must be marked by svgTapToFill.ts with: data-page-root="1"
+ * - Root SVG marked by svgTapToFill.ts with: data-page-root="1"
  * - Clickable regions: [data-region="R###"]
  * - Non-interactive decoration/outline: [data-role="outline"]
  *
- * Pointer-events policy (robust across browsers):
- * - Root SVG: pointer-events: auto (do NOT disable at root; can break subtree hit-testing)
- * - All SVG children: pointer-events: none (default)
- * - Regions: pointer-events: all
- * - Outline: pointer-events: none
- *
- * Rationale:
- * - Keeps document.elementFromPoint() returning actual SVG nodes under the finger.
- * - Prevents accidental interactions with non-region elements.
- * - Avoids Safari/Chrome quirks where pointer-events:none on <svg> blocks descendants.
+ * Pointer-events policy (robust across SVG structures):
+ * - Keep root <svg> hittable so elementFromPoint can return SVG nodes.
+ * - Do NOT globally disable pointer-events for all children (breaks many SVGs where
+ *   data-region is on <g> and the painted <path> is the actual hit target).
+ * - Explicitly enable regions and their drawable descendants.
  */
 
 /* ===== Pointer-events hardening (core) ===== */
@@ -26,9 +21,10 @@
   width: 100%;
   height: auto;
 
-  /* IMPORTANT: keep root hittable so descendants can be discovered by elementFromPoint */
+  /* Keep root hittable so descendants can be discovered by elementFromPoint */
   pointer-events: auto;
 
+  /* Hardening: prevent accidental selection/drags */
   user-select: none;
   -webkit-user-select: none;
 
@@ -39,16 +35,18 @@
   contain: layout paint;
 }
 
-/* Default: nothing inside SVG should capture pointer events unless explicitly allowed */
-[data-page-root] * {
+/* Do not disable pointer events for all children; it breaks SVG hit-testing in many structures. */
+
+[data-page-root] [data-role="outline"] {
   pointer-events: none;
 }
 
-[data-page-root] [data-region] {
-  /* Enable hit-testing only for paint regions */
+/* Ensure region AND its drawable descendants are hittable */
+[data-page-root] [data-region],
+[data-page-root] [data-region] * {
   pointer-events: all;
 
-  /* UX: desktop affordance (mobile ignores cursor) */
+  /* UX: signal interactivity; safe for desktop. Mobile ignores cursor. */
   cursor: pointer;
 
   /* iOS: remove gray tap highlight */
@@ -57,23 +55,15 @@
   /*
    * Ghost Path hardening:
    * Some browsers may treat paths without fill (or fill="none") as non-hittable.
-   * Setting transparent fill stabilizes hit-testing without visually altering the SVG.
-   *
-   * Note:
-   * - This does not override author-provided fill values that are set inline/JS later,
-   *   but ensures a baseline paint server exists for hit-test.
+   * Transparent fill stabilizes hit-testing without visible changes.
    */
   fill: transparent;
 
-  /* Optional: makes fill changes feel responsive without heavy layout cost */
+  /* Optional: responsive feel without heavy cost */
   transition: fill 0.15s ease-out;
 }
 
-[data-page-root] [data-role="outline"] {
-  pointer-events: none;
-}
-
-/* Defense-in-depth: outline nested inside a region must never capture events */
+/* Optional: prevent outlines inside regions from capturing events if authoring mistakes occur */
 [data-page-root] [data-region] [data-role="outline"] {
   pointer-events: none;
 }
@@ -87,7 +77,7 @@
   background: rgba(127, 127, 127, 0.06);
   padding: 10px;
 
-  /* Mobile: disable native scroll/zoom conflicts; zoomPan engine handles gestures */
+  /* Mobile: allow taps but avoid pinch/scroll conflicts; zoomPan engine handles gestures */
   touch-action: none;
 }
 
@@ -181,7 +171,8 @@
 
 /* Accessibility: reduce any future transitions/animations if added */
 @media (prefers-reduced-motion: reduce) {
-  [data-page-root] [data-region] {
+  [data-page-root] [data-region],
+  [data-page-root] [data-region] * {
     transition: none;
   }
 }

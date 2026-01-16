@@ -11,16 +11,9 @@ export type UseSvgPageParams = Readonly<{
   onMountError: (reason: string) => void
 }>
 
-/**
- * useSvgPage
- * - Mounts sanitized SVG into a host container when enabled/svg change.
- * - Applies fills whenever they change.
- * - Uses destructured params to satisfy exhaustive-deps and keep effects explicit.
- */
 export function useSvgPage(params: UseSvgPageParams): void {
   const { enabled, hostRef, svgRaw, fills, onMountError } = params
 
-  // Memoize options so the effect dependencies remain stable and explicit.
   const mountOptions = useMemo(
     () => ({
       requireViewBox: true,
@@ -31,32 +24,28 @@ export function useSvgPage(params: UseSvgPageParams): void {
     [],
   )
 
-  // Mount once per "enabled" and svg source.
+  // 1) Mount SVG only when enabled/svgRaw changes.
   useEffect(() => {
     if (!enabled) return
-
     const host = hostRef.current
     if (!host) return
 
     const res: MountResult = mountSvgIntoHost(host, svgRaw, mountOptions)
-
     if (!res.ok) {
       host.replaceChildren()
       onMountError(res.reason)
       return
     }
 
-    // Ensure initial fills are applied immediately after a successful mount.
+    // Apply current fills after mount (one-time per mount).
     applyFillsToContainer(host, fills)
-  }, [enabled, hostRef, svgRaw, onMountError, mountOptions, fills])
+  }, [enabled, svgRaw, hostRef, onMountError, mountOptions]) // <-- no fills here
 
-  // Apply fills when they change (only if already mounted).
+  // 2) Apply fills on every fills change (no remount).
   useEffect(() => {
     if (!enabled) return
-
     const host = hostRef.current
     if (!host) return
-
     applyFillsToContainer(host, fills)
   }, [enabled, hostRef, fills])
 }
