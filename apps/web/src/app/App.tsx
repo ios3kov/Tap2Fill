@@ -32,6 +32,7 @@ import {
   applyFillToRegion,
   hitTestRegionAtPoint,
   mountSvgIntoHost,
+  ensureSvgPointerPolicyStyle,
   type MountResult,
 } from "./svgTapToFill"
 
@@ -231,28 +232,27 @@ export default function App() {
   const undoUsedRef = useRef(0)
   const isGesturingRef = useRef(false)
 
-  const activeTouchPointersRef = useRef(0)
+  const activeTouchIdsRef = useRef<Set<number>>(new Set())
 
   const onCanvasPointerDownCapture = (e: React.PointerEvent) => {
     if (e.pointerType !== "touch") return
-    activeTouchPointersRef.current += 1
+    activeTouchIdsRef.current.add(e.pointerId)
   }
 
   const onCanvasPointerUpCapture = (e: React.PointerEvent) => {
     if (e.pointerType !== "touch") return
-    activeTouchPointersRef.current = Math.max(
-      0,
-      activeTouchPointersRef.current - 1,
-    )
+    activeTouchIdsRef.current.delete(e.pointerId)
   }
 
   const onCanvasPointerCancelCapture = (e: React.PointerEvent) => {
     if (e.pointerType !== "touch") return
-    activeTouchPointersRef.current = Math.max(
-      0,
-      activeTouchPointersRef.current - 1,
-    )
+    activeTouchIdsRef.current.delete(e.pointerId)
   }
+
+  useEffect(() => {
+    // Safety: if zoom/pan reports gesture ended, clear any stuck touch ids (iOS/Telegram can drop pointerup/cancel).
+    if (!isGesturing) activeTouchIdsRef.current.clear()
+  }, [isGesturing])
 
   useEffect(() => {
     clientRevRef.current = clientRev
@@ -288,6 +288,7 @@ export default function App() {
 
   useEffect(() => {
     const cleanup = tmaBootstrap()
+    ensureSvgPointerPolicyStyle()
 
     const id = window.setInterval(() => setTick((t) => t + 1), 250)
     window.setTimeout(() => window.clearInterval(id), 3000)
@@ -588,22 +589,37 @@ export default function App() {
 
   // ===== Tap-to-fill handler (blocked during gesture) =====
   async function onPointerDown(e: React.PointerEvent) {
-    // Block any fill during multi-touch (pinch/zoom) regardless of gesture detection timing.
-    if (e.pointerType === "touch") {
-      // Never fill with a secondary touch, and never fill while 2+ touches are active (pinch/zoom).
+    const isTouch = e.pointerType === "touch"
+
+    // Never fill while zoom/pan is actively gesturing.
+    if (isGesturingRef.current) return
+
+    if (typeof e.button === "number" && e.button !== 0) return
+
+    // For touch:
+    // - ignore non-primary touches
+    // - short delay: if a second finger arrives (pinch) or zoom/pan engages, abort filling
+    const x = clampInt(e.clientX, 0, window.innerWidth)
+    const y = clampInt(e.clientY, 0, window.innerHeight)
+
+    if (isTouch) {
       if (!e.isPrimary) return
-      if (activeTouchPointersRef.current >= 2) return
+      const pointerId = e.pointerId
+
+      // If multi-touch already active -> treat as pinch, do not fill.
+      if (activeTouchIdsRef.current.size >= 2) return
+
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 60))
+
+      // Pointer lifted/cancelled, multi-touch started, or gesture engaged -> do not fill.
+      if (!activeTouchIdsRef.current.has(pointerId)) return
+      if (activeTouchIdsRef.current.size >= 2) return
       if (isGesturingRef.current) return
     }
-
-    if (isGesturingRef.current) return
     if (typeof e.button === "number" && e.button !== 0) return
 
     const host = svgHostRef.current
     if (!host) return
-
-    const x = clampInt(e.clientX, 0, window.innerWidth)
-    const y = clampInt(e.clientY, 0, window.innerHeight)
 
     const hit = hitTestRegionAtPoint(x, y, {
       requireRegionIdPattern: true,
