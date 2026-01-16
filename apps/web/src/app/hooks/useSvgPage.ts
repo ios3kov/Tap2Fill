@@ -1,5 +1,5 @@
 // apps/web/src/app/hooks/useSvgPage.ts
-import { useEffect, useMemo } from "react"
+import { useEffect, useMemo, useRef } from "react"
 import { applyFillsToContainer, type FillMap } from "../coloring"
 import { mountSvgIntoHost, type MountResult } from "../svgTapToFill"
 
@@ -14,6 +14,12 @@ export type UseSvgPageParams = Readonly<{
 export function useSvgPage(params: UseSvgPageParams): void {
   const { enabled, hostRef, svgRaw, fills, onMountError } = params
 
+  // Keep latest fills in a ref so mount-effect doesn't depend on `fills`.
+  const fillsRef = useRef<FillMap>({})
+  useEffect(() => {
+    fillsRef.current = fills
+  }, [fills])
+
   const mountOptions = useMemo(
     () => ({
       requireViewBox: true,
@@ -24,9 +30,10 @@ export function useSvgPage(params: UseSvgPageParams): void {
     [],
   )
 
-  // 1) Mount SVG only when enabled/svgRaw changes.
+  // 1) Mount SVG only when enabled/svgRaw/options change.
   useEffect(() => {
     if (!enabled) return
+
     const host = hostRef.current
     if (!host) return
 
@@ -37,9 +44,9 @@ export function useSvgPage(params: UseSvgPageParams): void {
       return
     }
 
-    // Apply current fills after mount (one-time per mount).
-    applyFillsToContainer(host, fills)
-  }, [enabled, svgRaw, hostRef, onMountError, mountOptions]) // <-- no fills here
+    // Apply the latest fills right after mount (without re-mounting on fills change).
+    applyFillsToContainer(host, fillsRef.current)
+  }, [enabled, svgRaw, hostRef, onMountError, mountOptions])
 
   // 2) Apply fills on every fills change (no remount).
   useEffect(() => {
