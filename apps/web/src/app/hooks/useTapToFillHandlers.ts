@@ -84,11 +84,9 @@ export function useTapToFillHandlers(params: {
    */
   const packCtx: PackContext = useMemo(() => {
     return compilePackContext(regionOrder, palette, {
-      // Stage-3 expectation: canonical inputs should be stable and well-formed
       strictInputs: true,
       allowDuplicateRegionIds: false,
       allowDuplicatePaletteColors: false,
-      // Resilience during packing:
       ignoreUnknownRegions: true,
       ignoreUnknownColors: true,
     })
@@ -163,7 +161,6 @@ export function useTapToFillHandlers(params: {
         if (!isTouch && typeof e.button === "number" && e.button !== 0) return
 
         // If a commit is already in flight, drop this tap.
-        // This avoids races between multiple async commit() executions.
         if (isCommittingRef.current) return
 
         const x = clampInt(e.clientX, 0, window.innerWidth)
@@ -196,10 +193,7 @@ export function useTapToFillHandlers(params: {
           regionIdPattern: /^R\d{3}$/,
         })
 
-        if (!hit) {
-          // No region hit => no state mutation and no persistence.
-          return
-        }
+        if (!hit) return
 
         const color = activeColor()
         const prevFills = fillsRef.current
