@@ -1,4 +1,5 @@
 // apps/web/src/app/ui/ConfirmModal.tsx
+import type React from "react"
 import { useEffect, useId, useMemo, useRef } from "react"
 
 export type ConfirmVariant = "danger" | "default"
@@ -9,26 +10,17 @@ export type ConfirmModalProps = Readonly<{
   title: string
   description?: string
 
+  // Back-compat aliases (older App.tsx integrations)
+  message?: string
+  danger?: boolean
+
   confirmText?: string // default: "Confirm"
   cancelText?: string // default: "Cancel"
   variant?: ConfirmVariant // default: "default"
 
-  /**
-   * If true, clicking backdrop closes the modal (ESC still works).
-   * For destructive actions you usually want false.
-   */
   closeOnBackdrop?: boolean
-
-  /**
-   * Prevent closing while async work is running.
-   * Disables buttons and blocks Escape/backdrop close.
-   */
   busy?: boolean
 
-  /**
-   * Called when user confirms. If you return a Promise, you can set `busy`
-   * in the parent to lock the UI until it resolves.
-   */
   onConfirm: () => void | Promise<void>
 
   /**
@@ -36,37 +28,18 @@ export type ConfirmModalProps = Readonly<{
    * IMPORTANT: Parent must set `open=false`.
    */
   onClose: () => void
-
-  /**
-   * Optional: provide a DOM element to portal into later.
-   * For now we render inline to keep dependencies minimal.
-   */
 }>
 
-/**
- * ConfirmModal — a lightweight, dependency-free confirm dialog.
- *
- * Accessibility:
- * - role="dialog", aria-modal, labelledby/describe.
- * - Focus management: initial focus to Cancel (safer), restore focus on close.
- * - Escape to close (unless busy).
- *
- * Safety:
- * - No dangerouslySetInnerHTML.
- * - Defensive event handling (no accidental propagation).
- *
- * Styling:
- * - Inline styles are intentionally minimal and theme-aware via Telegram vars.
- * - You may move styles to CSS later without changing the API.
- */
 export function ConfirmModal(props: ConfirmModalProps) {
   const {
     open,
     title,
     description,
+    message,
+    danger,
     confirmText = "Confirm",
     cancelText = "Cancel",
-    variant = "default",
+    variant = danger ? "danger" : "default",
     closeOnBackdrop = false,
     busy = false,
     onConfirm,
@@ -79,32 +52,32 @@ export function ConfirmModal(props: ConfirmModalProps) {
   const cancelBtnRef = useRef<HTMLButtonElement | null>(null)
   const lastActiveElRef = useRef<HTMLElement | null>(null)
 
-  const hasDescription = useMemo(
-    () => typeof description === "string" && description.trim().length > 0,
-    [description],
-  )
+  const resolvedDescription = useMemo(() => {
+    const d = typeof description === "string" ? description.trim() : ""
+    if (d) return d
+    const m = typeof message === "string" ? message.trim() : ""
+    return m || undefined
+  }, [description, message])
 
-  // Focus: capture last active element; focus cancel on open; restore on close.
+  const hasDescription = useMemo(() => {
+    return (
+      typeof resolvedDescription === "string" &&
+      resolvedDescription.trim().length > 0
+    )
+  }, [resolvedDescription])
+
   useEffect(() => {
     if (!open) return
-
     lastActiveElRef.current =
       (document.activeElement as HTMLElement | null) ?? null
-
-    // Defer focus until mounted.
     const id = window.setTimeout(() => {
       cancelBtnRef.current?.focus()
     }, 0)
-
-    return () => {
-      window.clearTimeout(id)
-    }
+    return () => window.clearTimeout(id)
   }, [open])
 
   useEffect(() => {
     if (open) return
-
-    // Restore focus only when we were previously open.
     const el = lastActiveElRef.current
     if (el && typeof el.focus === "function") {
       try {
@@ -116,7 +89,6 @@ export function ConfirmModal(props: ConfirmModalProps) {
     lastActiveElRef.current = null
   }, [open])
 
-  // ESC to close.
   useEffect(() => {
     if (!open) return
 
@@ -148,8 +120,7 @@ export function ConfirmModal(props: ConfirmModalProps) {
     try {
       await onConfirm()
     } catch {
-      // Intentionally swallow here; the parent can surface errors as desired.
-      // Keeping the modal open is the parent's responsibility via `open` prop.
+      // Swallow: parent decides error surface & open state.
     }
   }
 
@@ -209,7 +180,7 @@ export function ConfirmModal(props: ConfirmModalProps) {
                 opacity: 0.85,
               }}
             >
-              {description}
+              {resolvedDescription}
             </div>
           )}
         </div>

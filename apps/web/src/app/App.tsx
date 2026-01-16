@@ -35,10 +35,13 @@ import {
   type MountResult,
 } from "./svgTapToFill"
 
-import { attachZoomPan, type ZoomPanTransform } from "./viewport/zoomPan"
+import {
+  attachZoomPan,
+  type Transform as ZoomPanTransform,
+} from "./viewport/zoomPan"
 import "./viewport/zoomPan.css"
 
-import { Gallery } from "./ui/Gallery"
+import Gallery from "./ui/Gallery"
 import "./ui/gallery.css"
 
 import { ConfirmModal } from "./ui/ConfirmModal"
@@ -131,8 +134,8 @@ function sanitizeFillMap(input: unknown, maxEntries = 20000): FillMap {
 
 /**
  * Snapshot helpers
- * - We store BOTH a FillMap (fast UI apply) and packed progressB64 (future-proof for API).
- * - Until regionIndex mapping is wired, packed progress is "best effort" but preserved for forward compatibility.
+ * - Stage 3+ source of truth is packed progress (progressB64 + meta).
+ * - FillMap is kept only in live UI state; v2 snapshot does not persist it.
  */
 function buildSnapshot(params: {
   clientRev: number
@@ -140,7 +143,6 @@ function buildSnapshot(params: {
   pageId: string
   contentHash: string
   paletteIdx: number
-  fills: FillMap
   progressB64: string
   regionsCount: number
   paletteLen: number
@@ -155,7 +157,6 @@ function buildSnapshot(params: {
     demoCounter: clampNonNegativeInt(params.demoCounter, 0),
     paletteIdx: clampNonNegativeInt(params.paletteIdx, 0),
 
-    fills: params.fills,
     progressB64: String(params.progressB64 ?? ""),
     regionsCount: clampNonNegativeInt(params.regionsCount, 0),
     paletteLen: clampNonNegativeInt(params.paletteLen, 0),
@@ -276,12 +277,16 @@ export default function App() {
   const runtimeLabel = isTma() ? "Telegram Mini App" : "Web (standalone)"
   const canCallServer = hasTelegramInitData()
 
+  // Gallery progress placeholder (Stage 3 demo: empty map; later: derive from snapshots per catalog item)
+  const progressByPageId = useMemo<
+    Record<string, { pageId: string; ratio: number; completed: boolean }>
+  >(() => ({}), [])
+
   const persistSnapshotNow = useCallback(
     async (params: {
       nextClientRev: number
       nextDemoCounter: number
       nextPaletteIdx: number
-      nextFills: FillMap
       nextProgressB64: string
       nextUndoStackB64: string[]
       nextUndoUsed: number
@@ -292,7 +297,6 @@ export default function App() {
         pageId: DEMO_PAGE_ID,
         contentHash: DEMO_CONTENT_HASH,
         paletteIdx: params.nextPaletteIdx,
-        fills: params.nextFills,
         progressB64: params.nextProgressB64,
         regionsCount: DEMO_REGIONS_COUNT,
         paletteLen: DEMO_PALETTE.length,
@@ -342,12 +346,17 @@ export default function App() {
         if (packed && rc > 0 && pl > 0) {
           setProgressB64(packed)
 
-          const decodedFills = decodeProgressB64ToFillMap(
-            packed,
-            rc,
-            pl,
-            DEMO_PALETTE,
-          )
+          // decodeProgressB64ToFillMap expects positional args (b64, regionsCount, paletteLen, palette)
+          const decodedFills = decodeProgressB64ToFillMap({
+            progressB64: packed,
+            regionsCount: rc,
+            paletteLen: pl,
+            regionOrder: Array.from(
+              { length: rc },
+              (_, i) => `R${String(i + 1).padStart(3, "0")}`,
+            ),
+            palette: DEMO_PALETTE,
+          })
           setFills(decodedFills)
         } else {
           // Legacy or partially migrated snapshot: fall back to fills if present.
@@ -395,7 +404,6 @@ export default function App() {
             nextClientRev,
             nextDemoCounter: demoCounterRef.current,
             nextPaletteIdx: paletteIdxRef.current,
-            nextFills: fillsRef.current,
             nextProgressB64: progressB64Ref.current,
             nextUndoStackB64: undoStackRef.current,
             nextUndoUsed: undoUsedRef.current,
@@ -500,21 +508,14 @@ export default function App() {
 
     applyTransformStyle(content, transform)
 
-    const detach = attachZoomPan(container, {
-      onTransform: (t) => {
-        applyTransformStyle(content, t)
-        setTransform(t)
-      },
-      onGestureState: (s) => {
-        setIsGesturing(s.isGesturing)
-        if (s.isGesturing) container.classList.add("zp-gesturing")
-        else container.classList.remove("zp-gesturing")
-      },
+    const zp = attachZoomPan(container, {
+      onTransform: (t) => setTransform(t),
+      onGestureState: (s) => setIsGesturing(s.isGesturing || s.isWheelZooming),
+      initial: transform,
     })
 
     return () => {
-      detach()
-      container.classList.remove("zp-gesturing")
+      zp.destroy()
     }
     // transform is applied imperatively; avoid reattaching for each transform tick.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -548,7 +549,6 @@ export default function App() {
       nextClientRev,
       nextDemoCounter,
       nextPaletteIdx: params.nextPaletteIdx,
-      nextFills: params.nextFills,
       nextProgressB64: params.nextProgressB64,
       nextUndoStackB64: params.nextUndoStackB64,
       nextUndoUsed: params.nextUndoUsed,
@@ -625,14 +625,6 @@ export default function App() {
     await saveLastPageId(id)
   }
 
-  async function continueFlow(): Promise<void> {
-    if (lastPageId) {
-      await openPage(lastPageId)
-      return
-    }
-    await openPage(DEMO_PAGE_ID)
-  }
-
   async function hardResetAllLocal(): Promise<void> {
     await deletePageSnapshot(DEMO_PAGE_ID, DEMO_CONTENT_HASH)
     await saveLastPageId(null)
@@ -664,7 +656,6 @@ export default function App() {
       nextClientRev: 0,
       nextDemoCounter: 0,
       nextPaletteIdx: 0,
-      nextFills: {},
       nextProgressB64: "",
       nextUndoStackB64: [],
       nextUndoUsed: 0,
@@ -729,12 +720,16 @@ export default function App() {
 
     let nextFills: FillMap = {}
     try {
-      nextFills = decodeProgressB64ToFillMap(
-        prevPacked,
-        DEMO_REGIONS_COUNT,
-        DEMO_PALETTE.length,
-        DEMO_PALETTE,
-      )
+      nextFills = decodeProgressB64ToFillMap({
+        progressB64: prevPacked,
+        regionsCount: DEMO_REGIONS_COUNT,
+        paletteLen: DEMO_PALETTE.length,
+        regionOrder: Array.from(
+          { length: DEMO_REGIONS_COUNT },
+          (_, i) => `R${String(i + 1).padStart(3, "0")}`,
+        ),
+        palette: DEMO_PALETTE,
+      })
     } catch {
       nextFills = {}
     }
@@ -835,9 +830,11 @@ export default function App() {
       {route.name === "gallery" && (
         <div style={{ marginTop: 10 }}>
           <Gallery
-            onOpen={(id) => void openPage(id)}
-            onContinue={() => void continueFlow()}
-            continuePageId={lastPageId}
+            progressByPageId={progressByPageId}
+            lastPageId={lastPageId}
+            onOpenPage={(page) => {
+              void openPage(page.id)
+            }}
           />
 
           <div className="t2f-card" style={{ marginTop: 12 }}>
@@ -955,13 +952,14 @@ export default function App() {
 
           <ConfirmModal
             open={confirmResetOpen}
-            title="Start over?"
-            message="This will clear all fills on this page. This cannot be undone once confirmed."
-            confirmText="Start Over"
+            title="Reset page?"
+            description="This will clear all fills on this page. This cannot be undone once confirmed."
+            confirmText="Reset"
             cancelText="Cancel"
-            danger
-            onConfirm={() => void startOverPageConfirmed()}
-            onCancel={() => setConfirmResetOpen(false)}
+            variant="danger"
+            closeOnBackdrop={false}
+            onConfirm={startOverPageConfirmed}
+            onClose={() => setConfirmResetOpen(false)}
           />
 
           <CompletionReward

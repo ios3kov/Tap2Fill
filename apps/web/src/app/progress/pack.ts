@@ -86,6 +86,12 @@ function isNonEmptyString(v: unknown): v is string {
   return typeof v === "string" && v.trim().length > 0
 }
 
+function isFiniteNonNegativeInt(v: unknown): v is number {
+  return (
+    typeof v === "number" && Number.isFinite(v) && v >= 0 && Number.isInteger(v)
+  )
+}
+
 function clampInt(n: number, min: number, max: number): number {
   if (!Number.isFinite(n)) return min
   const x = Math.trunc(n)
@@ -228,7 +234,6 @@ export function packFillMapToBytes(
       throw new Error(`PACK_UNKNOWN_COLOR:${color}`)
     }
 
-    // cIdx is within 0..paletteLen-1 by construction
     bytes[rIdx] = cIdx
   }
 
@@ -358,8 +363,38 @@ export function unpackPackedProgressToFillMap(
   const res = decodeBase64ToBytes(packed.progressB64, rc, pl, o)
   if (!res.ok) return {}
 
-  // Use provided region order/palette for mapping to UI colors.
   return unpackBytesToFillMap(res.bytes, regions, pal, o)
+}
+
+/**
+ * Back-compat export for App.tsx (older integration):
+ * decode packed progress (base64 bytes) directly into FillMap.
+ *
+ * This assumes:
+ * - regionOrder is the canonical order used to pack the bytes
+ * - palette is the canonical palette used to map indices -> CSS colors
+ */
+export function decodeProgressB64ToFillMap(args: {
+  progressB64: string
+  regionsCount: number
+  paletteLen: number
+  regionOrder: readonly string[]
+  palette: readonly string[]
+  opts?: PackOptions
+}): FillMap {
+  const res = decodeBase64ToBytes(
+    args.progressB64,
+    args.regionsCount,
+    args.paletteLen,
+    args.opts,
+  )
+  if (!res.ok) return {}
+  return unpackBytesToFillMap(
+    res.bytes,
+    args.regionOrder,
+    args.palette,
+    args.opts,
+  )
 }
 
 export const PROGRESS_UNPAINTED = UNPAINTED

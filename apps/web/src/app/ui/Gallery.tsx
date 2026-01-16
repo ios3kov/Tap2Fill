@@ -1,7 +1,7 @@
 // apps/web/src/app/ui/Gallery.tsx
 
 import { useEffect, useMemo, useState } from "react"
-import type { CatalogResponse, PageMeta } from "../pages/types"
+import type { CatalogResponse, PageMeta, ThumbSource } from "../pages/types"
 import { listPages } from "../pages/loadCatalog"
 
 export type GalleryItemProgress = {
@@ -59,6 +59,22 @@ function hasOwn(o: object, k: string): boolean {
   return Object.prototype.hasOwnProperty.call(o, k)
 }
 
+function resolveThumbUrl(page: PageMeta): string {
+  // Preferred: structured thumb
+  const thumb = page.thumb as ThumbSource | undefined
+  if (thumb && typeof thumb === "object") {
+    if (thumb.kind === "path") return safeText(thumb.path, "")
+    if (thumb.kind === "url") return safeText(thumb.url, "")
+  }
+
+  // Back-compat: some legacy code might still attach thumbUrl directly on PageMeta
+  // (even though normalizePageMeta stores it into `thumb`).
+  // We keep it permissive to avoid UI regressions.
+  const anyPage = page as unknown as { thumbUrl?: unknown }
+  const legacy = safeText(anyPage.thumbUrl, "")
+  return legacy
+}
+
 /**
  * Stage 3 Gallery:
  * - Reads static catalog in batches (cursor pagination).
@@ -70,7 +86,7 @@ function hasOwn(o: object, k: string): boolean {
  * - Uses <img> with safe attributes; URLs are treated as app-controlled assets.
  * - Avoids exceptions on malformed progress maps.
  */
-export default function Gallery(props: GalleryProps) {
+export function Gallery(props: GalleryProps) {
   const {
     progressByPageId,
     lastPageId,
@@ -194,7 +210,7 @@ export default function Gallery(props: GalleryProps) {
       >
         {items.map((p) => {
           const title = safeText(p.title, p.id)
-          const thumbUrl = safeText(p.thumbUrl, "")
+          const thumbUrl = resolveThumbUrl(p)
           const prog = readProgress(p.id)
           const ratio = prog ? prog.ratio : 0
           const completed = prog ? prog.completed : false
@@ -272,3 +288,5 @@ export default function Gallery(props: GalleryProps) {
     </section>
   )
 }
+
+export default Gallery
