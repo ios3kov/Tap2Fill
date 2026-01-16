@@ -9,7 +9,10 @@ import {
  * Imperative transform application (hot path).
  * translate3d nudges GPU compositing on most browsers.
  */
-export function applyTransformStyle(el: HTMLElement, t: ZoomPanTransform): void {
+export function applyTransformStyle(
+  el: HTMLElement,
+  t: ZoomPanTransform,
+): void {
   el.style.transform = `translate3d(${t.tx}px, ${t.ty}px, 0) scale(${t.scale})`
 }
 
@@ -124,5 +127,12 @@ export function useZoomPan(params: {
     // Intentionally NOT depending on `transform` to avoid re-attaching the engine
     // during interaction. Initial transform is applied once on enable/mount.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [enabled, containerRef, contentRef, setTransform, setIsGesturing, maxStateFps])
+  }, [
+    enabled,
+    containerRef,
+    contentRef,
+    setTransform,
+    setIsGesturing,
+    maxStateFps,
+  ])
 }

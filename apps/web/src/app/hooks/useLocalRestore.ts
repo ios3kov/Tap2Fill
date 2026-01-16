@@ -76,7 +76,9 @@ export function useLocalRestore(params: {
       )
 
       const packed =
-        typeof snapshot.progressB64 === "string" ? snapshot.progressB64.trim() : ""
+        typeof snapshot.progressB64 === "string"
+          ? snapshot.progressB64.trim()
+          : ""
       const rc = clampNonNegativeInt(snapshot.regionsCount, 0)
       const pl = clampNonNegativeInt(snapshot.paletteLen, 0)
 

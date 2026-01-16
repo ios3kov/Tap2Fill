@@ -173,10 +173,17 @@ function sanitizeProgressB64(params: {
   }
 
   // Canonicalize: decode -> encode (stabilizes padding/format).
-  return { progressB64: encodeBytesToBase64(res.bytes), regionsCount: rc, paletteLen: pl }
+  return {
+    progressB64: encodeBytesToBase64(res.bytes),
+    regionsCount: rc,
+    paletteLen: pl,
+  }
 }
 
-function sanitizeUndoStackB64(input: unknown, expectedB64Len: number): string[] {
+function sanitizeUndoStackB64(
+  input: unknown,
+  expectedB64Len: number,
+): string[] {
   if (!Array.isArray(input)) return []
 
   const out: string[] = []
@@ -242,7 +249,9 @@ function normalizeV1(
   fallbackPaletteLen: number,
   fallbackRegionsCount: number,
 ): PageSnapshotV2 {
-  const paletteIdx = isFiniteNonNegativeInt(snap.paletteIdx) ? snap.paletteIdx : 0
+  const paletteIdx = isFiniteNonNegativeInt(snap.paletteIdx)
+    ? snap.paletteIdx
+    : 0
   const rc = clampInt(fallbackRegionsCount, 0, MAX_REGIONS)
   const pl = clampInt(fallbackPaletteLen, 0, MAX_PALETTE_LEN)
 
@@ -251,7 +260,9 @@ function normalizeV1(
     pageId,
     contentHash,
     clientRev: isFiniteNonNegativeInt(snap.clientRev) ? snap.clientRev : 0,
-    demoCounter: isFiniteNonNegativeInt(snap.demoCounter) ? snap.demoCounter : 0,
+    demoCounter: isFiniteNonNegativeInt(snap.demoCounter)
+      ? snap.demoCounter
+      : 0,
     paletteIdx,
 
     progressB64: makeEmptyProgressB64(rc),
@@ -275,7 +286,9 @@ function normalizeV2(
   if (snap.pageId !== pageId) return null
   if (snap.contentHash !== contentHash) return null
 
-  const paletteIdx = isFiniteNonNegativeInt(snap.paletteIdx) ? snap.paletteIdx : 0
+  const paletteIdx = isFiniteNonNegativeInt(snap.paletteIdx)
+    ? snap.paletteIdx
+    : 0
 
   const fallbackRc = clampInt(fallbackRegionsCount, 0, MAX_REGIONS)
   const fallbackPl = clampInt(fallbackPaletteLen, 0, MAX_PALETTE_LEN)
@@ -306,7 +319,9 @@ function normalizeV2(
     pageId,
     contentHash,
     clientRev: isFiniteNonNegativeInt(snap.clientRev) ? snap.clientRev : 0,
-    demoCounter: isFiniteNonNegativeInt(snap.demoCounter) ? snap.demoCounter : 0,
+    demoCounter: isFiniteNonNegativeInt(snap.demoCounter)
+      ? snap.demoCounter
+      : 0,
     paletteIdx,
 
     // Keep if present (compat), but not used for correctness
@@ -362,7 +377,9 @@ export async function loadPageSnapshot(
 }
 
 export async function savePageSnapshot(snap: PageSnapshotV2): Promise<void> {
-  const paletteIdx = isFiniteNonNegativeInt(snap.paletteIdx) ? snap.paletteIdx : 0
+  const paletteIdx = isFiniteNonNegativeInt(snap.paletteIdx)
+    ? snap.paletteIdx
+    : 0
 
   const p = sanitizeProgressB64({
     progressB64: snap.progressB64,
@@ -383,7 +400,9 @@ export async function savePageSnapshot(snap: PageSnapshotV2): Promise<void> {
     pageId: snap.pageId,
     contentHash: snap.contentHash,
     clientRev: isFiniteNonNegativeInt(snap.clientRev) ? snap.clientRev : 0,
-    demoCounter: isFiniteNonNegativeInt(snap.demoCounter) ? snap.demoCounter : 0,
+    demoCounter: isFiniteNonNegativeInt(snap.demoCounter)
+      ? snap.demoCounter
+      : 0,
     paletteIdx,
 
     // Intentionally do not persist fills to avoid bloat.

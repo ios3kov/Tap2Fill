@@ -163,7 +163,10 @@ export function attachZoomPan(
   container: HTMLElement,
   args: AttachArgs,
 ): ZoomPanController {
-  const opts: Required<ZoomPanOptions> = { ...DEFAULTS, ...(args.options ?? {}) }
+  const opts: Required<ZoomPanOptions> = {
+    ...DEFAULTS,
+    ...(args.options ?? {}),
+  }
 
   const t: Transform = {
     tx: isFiniteNumber(args.initial?.tx) ? args.initial!.tx! : 0,
@@ -264,13 +267,16 @@ export function attachZoomPan(
 
   function scheduleGestureOff(): void {
     clearTimer(gestureOffTimer)
-    gestureOffTimer = window.setTimeout(() => {
-      gestureOffTimer = null
-      if (pointers.size === 0) {
-        setPinching(false)
-        setGesturing(false)
-      }
-    }, Math.max(0, Math.trunc(opts.gestureEndDebounceMs)))
+    gestureOffTimer = window.setTimeout(
+      () => {
+        gestureOffTimer = null
+        if (pointers.size === 0) {
+          setPinching(false)
+          setGesturing(false)
+        }
+      },
+      Math.max(0, Math.trunc(opts.gestureEndDebounceMs)),
+    )
   }
 
   function scheduleWheelOff(): void {
@@ -355,7 +361,10 @@ export function attachZoomPan(
     if (g.isPinching) return
 
     const speed = Math.sqrt(velX * velX + velY * velY)
-    if (!Number.isFinite(speed) || speed < Math.max(0, opts.momentumMinVelocity))
+    if (
+      !Number.isFinite(speed) ||
+      speed < Math.max(0, opts.momentumMinVelocity)
+    )
       return
 
     // Exponential decay: v(t+dt) = v(t) * exp(-friction * dt)
@@ -404,7 +413,11 @@ export function attachZoomPan(
       }
     }
 
-    pointers.set(ev.pointerId, { id: ev.pointerId, x: ev.clientX, y: ev.clientY })
+    pointers.set(ev.pointerId, {
+      id: ev.pointerId,
+      x: ev.clientX,
+      y: ev.clientY,
+    })
     setGesturing(true)
 
     if (pointers.size === 1) {
