@@ -12,6 +12,10 @@
  * - Do NOT globally disable pointer-events for all children (breaks many SVGs where
  *   data-region is on <g> and the painted <path> is the actual hit target).
  * - Explicitly enable regions and their drawable descendants.
+ *
+ * Wrapper policy (zoom/pan):
+ * - Make intermediate wrappers transparent for hit-testing,
+ *   but DO NOT touch the handler container (.t2f-canvas / .zp-container).
  */
 
 /* ===== Pointer-events hardening (core) ===== */
@@ -35,8 +39,7 @@
   contain: layout paint;
 }
 
-/* Do not disable pointer events for all children; it breaks SVG hit-testing in many structures. */
-
+/* Non-interactive decoration/outline must never intercept pointer events */
 [data-page-root] [data-role="outline"] {
   pointer-events: none;
 }
@@ -52,19 +55,30 @@
   /* iOS: remove gray tap highlight */
   -webkit-tap-highlight-color: transparent;
 
-  /*
-   * Ghost Path hardening:
-   * Some browsers may treat paths without fill (or fill="none") as non-hittable.
-   * Transparent fill stabilizes hit-testing without visible changes.
-   */
-  fill: transparent;
-
   /* Optional: responsive feel without heavy cost */
   transition: fill 0.15s ease-out;
 }
 
+/*
+ * Ghost Path hardening (conditional):
+ * Apply transparent fill ONLY when author didn't specify fill.
+ * This stabilizes hit-testing without overriding authored/animated fills.
+ */
+[data-page-root] [data-region]:not([fill]),
+[data-page-root] [data-region] *:not([fill]) {
+  fill: transparent;
+}
+
 /* Optional: prevent outlines inside regions from capturing events if authoring mistakes occur */
 [data-page-root] [data-region] [data-role="outline"] {
+  pointer-events: none;
+}
+
+/* ===== Zoom/Pan wrappers (must not block elementFromPoint) ===== */
+
+/* These wrappers should not intercept hit-testing; handlers live on .t2f-canvas/.zp-container */
+.zp-content,
+.t2f-svgHost {
   pointer-events: none;
 }
 
