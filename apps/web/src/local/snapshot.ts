@@ -4,37 +4,24 @@ import { delKey, getJson, setJson } from "./storage"
 export type PageId = string
 export type ContentHash = string
 
-/**
- * Legacy snapshot (Stage 2 / earlier).
- * Kept for backwards compatibility only.
- *
- * NOTE:
- * - We intentionally do NOT carry "fills" forward in v2 storage.
- * - Stage 3+ source of truth is packed progress (progressB64 + meta).
- */
 export type PageSnapshotV1 = {
   schemaVersion: 1
   pageId: PageId
   contentHash: ContentHash
-
   clientRev: number
   demoCounter: number
-
-  // legacy fields (ignored on upgrade):
   fills?: Record<string, string>
   paletteIdx?: number
-
   updatedAtMs: number
 }
 
 /**
  * Current snapshot (Stage 3+), aligned with App.tsx usage.
  *
- * Fields:
- * - progressB64: packed progress (forward compatible)
- * - regionsCount/paletteLen: strict meta for decoding/validation
- * - undoStackB64: stack of previous packed progress states (bounded)
- * - undoBudgetUsed: persisted for determinism across reloads
+ * NOTE:
+ * - Packed progress is the source of truth.
+ * - `fills` is allowed as an optional debug/compat field (so App.tsx can pass it),
+ *   but we intentionally do not persist it to storage to avoid bloat/duplication.
  */
 export type PageSnapshotV2 = {
   schemaVersion: 2
@@ -43,20 +30,34 @@ export type PageSnapshotV2 = {
 
   clientRev: number
   demoCounter: number
-
   paletteIdx: number
 
+  // Optional debug/compat layer (not persisted by savePageSnapshot)
+  fills?: Record<string, string>
+
+  // Packed progress
   progressB64: string
   regionsCount: number
   paletteLen: number
 
+  // Undo (Stage 3): stack items are base64 strings (historical packed progress snapshots),
+  // budgeted by session.
   undoStackB64: string[]
   undoBudgetUsed: number
 
   updatedAtMs: number
 }
 
-export type AnyPageSnapshot = PageSnapshotV1 | PageSnapshotV2
+/**
+ * Back-compat helper type:
+ * In some intermediate builds, storage might contain `undoStackJson`.
+ * We accept it on read, but never persist it.
+ */
+type PageSnapshotV2Legacy = PageSnapshotV2 & {
+  undoStackJson?: unknown
+}
+
+export type AnyPageSnapshot = PageSnapshotV1 | PageSnapshotV2Legacy
 
 export type LocalUserStateV1 = {
   schemaVersion: 1
@@ -67,13 +68,11 @@ export type LocalUserStateV1 = {
 const KEY_PREFIX = "t2f:v2"
 const KEY_LAST_PAGE = `${KEY_PREFIX}:user:lastPage`
 
-const UNPAINTED = 255 // sentinel for packed progress bytes
-const MAX_UNDO_STACK = 64 // App.tsx uses 64 cap; keep consistent here
+const UNPAINTED = 255
+const MAX_UNDO_STACK = 64
 const MAX_REGIONS = 20_000
 const MAX_PALETTE_LEN = 64
-const MAX_B64_LEN = 200_000 // safety cap for payload size
-
-/* ----------------------------- small validators ---------------------------- */
+const MAX_B64_LEN = 200_000
 
 function isNonEmptyString(v: unknown): v is string {
   return typeof v === "string" && v.trim().length > 0
@@ -90,13 +89,6 @@ function clampInt(n: number, min: number, max: number): number {
   const x = Math.trunc(n)
   return Math.max(min, Math.min(max, x))
 }
-
-/* -------------------------- Base64 pack/unpack ---------------------------- */
-/**
- * We store progress as base64 of raw bytes (Uint8Array).
- * - Strict and compact
- * - Independent of Node Buffer
- */
 
 function bytesToBase64(bytes: Uint8Array): string {
   let bin = ""
@@ -147,7 +139,7 @@ function sanitizeProgressB64(params: {
     : ""
   const bytes = rawB64 ? base64ToBytes(rawB64) : null
 
-  if (!bytes) {
+  if (!bytes || bytes.length !== rc) {
     return {
       progressB64: makeEmptyProgressB64(rc),
       regionsCount: rc,
@@ -155,26 +147,10 @@ function sanitizeProgressB64(params: {
     }
   }
 
-  if (bytes.length !== rc) {
-    return {
-      progressB64: makeEmptyProgressB64(rc),
-      regionsCount: rc,
-      paletteLen: pl,
-    }
-  }
-
-  // Validate each byte: UNPAINTED or < paletteLen
   for (let i = 0; i < bytes.length; i++) {
     const v = bytes[i]
     if (v === UNPAINTED) continue
-    if (pl === 0) {
-      return {
-        progressB64: makeEmptyProgressB64(rc),
-        regionsCount: rc,
-        paletteLen: pl,
-      }
-    }
-    if (v >= pl) {
+    if (pl === 0 || v >= pl) {
       return {
         progressB64: makeEmptyProgressB64(rc),
         regionsCount: rc,
@@ -183,7 +159,7 @@ function sanitizeProgressB64(params: {
     }
   }
 
-  // Canonicalize base64 (avoid alternative encodings)
+  // normalize (trim -> decode -> encode) not needed; keep as canonical from bytes
   return { progressB64: bytesToBase64(bytes), regionsCount: rc, paletteLen: pl }
 }
 
@@ -196,18 +172,31 @@ function sanitizeUndoStackB64(input: unknown): string[] {
     const s = item.trim()
     if (!s) continue
     if (s.length > MAX_B64_LEN) continue
+    // We do not decode each item here (expensive); structural check is enough.
+    // Full length check against progress happens in normalize/save.
     out.push(s)
   }
   return out
 }
 
-/* ------------------------------- keying ---------------------------------- */
+/**
+ * Reads undo stack from v2 snapshot.
+ * Accepts legacy `undoStackJson` (if it exists) by treating it as `undoStackB64`.
+ */
+function readUndoStackCompat(snap: PageSnapshotV2Legacy): string[] {
+  const canonical = sanitizeUndoStackB64((snap as PageSnapshotV2).undoStackB64)
+  if (canonical.length > 0) return canonical
+
+  // legacy fallback
+  const legacy = sanitizeUndoStackB64(
+    (snap as PageSnapshotV2Legacy).undoStackJson,
+  )
+  return legacy
+}
 
 export function makePageKey(pageId: PageId, contentHash: ContentHash): string {
   return `${KEY_PREFIX}:page:${pageId}:hash:${contentHash}`
 }
-
-/* ----------------------------- lastPageId -------------------------------- */
 
 export async function loadLastPageId(): Promise<PageId | null> {
   const s = await getJson<LocalUserStateV1>(KEY_LAST_PAGE)
@@ -224,8 +213,6 @@ export async function saveLastPageId(pageId: PageId | null): Promise<void> {
   await setJson(KEY_LAST_PAGE, payload)
 }
 
-/* ----------------------------- page snapshot ------------------------------ */
-
 function normalizeV1(
   snap: PageSnapshotV1,
   pageId: PageId,
@@ -236,9 +223,6 @@ function normalizeV1(
   const paletteIdx = isFiniteNonNegativeInt(snap.paletteIdx)
     ? snap.paletteIdx
     : 0
-
-  // v1 -> v2: cannot safely pack legacy fills without a stable region-index mapping.
-  // Keep deterministic empty packed progress with provided fallbacks.
   const rc = clampInt(fallbackRegionsCount, 0, MAX_REGIONS)
   const pl = clampInt(fallbackPaletteLen, 0, MAX_PALETTE_LEN)
 
@@ -252,6 +236,7 @@ function normalizeV1(
       : 0,
     paletteIdx,
 
+    // v1 fills intentionally dropped from persistence semantics; keep only optional in-memory if needed
     progressB64: makeEmptyProgressB64(rc),
     regionsCount: rc,
     paletteLen: pl,
@@ -266,7 +251,7 @@ function normalizeV1(
 }
 
 function normalizeV2(
-  snap: PageSnapshotV2,
+  snap: PageSnapshotV2Legacy,
   pageId: PageId,
   contentHash: ContentHash,
   fallbackPaletteLen: number,
@@ -279,7 +264,6 @@ function normalizeV2(
     ? snap.paletteIdx
     : 0
 
-  // Prefer stored meta; if invalid, use fallbacks.
   const fallbackRc = clampInt(fallbackRegionsCount, 0, MAX_REGIONS)
   const fallbackPl = clampInt(fallbackPaletteLen, 0, MAX_PALETTE_LEN)
 
@@ -296,18 +280,17 @@ function normalizeV2(
     paletteLen: plCandidate,
   })
 
-  const undoStackB64 = sanitizeUndoStackB64(snap.undoStackB64)
-
   const undoUsed = isFiniteNonNegativeInt(snap.undoBudgetUsed)
     ? clampInt(snap.undoBudgetUsed, 0, MAX_UNDO_STACK)
     : 0
+  const undoStackB64 = readUndoStackCompat(snap)
 
-  // Keep only undo entries that match current progress length (cheap validation).
-  const bytesLen = base64ToBytes(p.progressB64)?.length ?? 0
+  // Ensure undo snapshots match current progress length to avoid poisoning the undo stack.
+  const progressLen = base64ToBytes(p.progressB64)?.length ?? 0
   const safeUndoStack =
-    bytesLen > 0
+    progressLen > 0
       ? undoStackB64.filter(
-          (b) => (base64ToBytes(b)?.length ?? -1) === bytesLen,
+          (b) => (base64ToBytes(b)?.length ?? -1) === progressLen,
         )
       : []
 
@@ -320,6 +303,9 @@ function normalizeV2(
       ? snap.demoCounter
       : 0,
     paletteIdx,
+
+    // Keep if present (compat), but it's not used for correctness
+    fills: snap.fills,
 
     progressB64: p.progressB64,
     regionsCount: p.regionsCount,
@@ -334,18 +320,10 @@ function normalizeV2(
   }
 }
 
-/**
- * Load a snapshot for a page.
- *
- * v2 is preferred. v1 is upgraded to v2 deterministically with safe defaults.
- */
 export async function loadPageSnapshot(
   pageId: PageId,
   contentHash: ContentHash,
-  opts?: {
-    regionsCount?: number
-    paletteLen?: number
-  },
+  opts?: { regionsCount?: number; paletteLen?: number },
 ): Promise<PageSnapshotV2 | null> {
   const key = makePageKey(pageId, contentHash)
   const snap = await getJson<AnyPageSnapshot>(key)
@@ -356,7 +334,7 @@ export async function loadPageSnapshot(
 
   if ((snap as AnyPageSnapshot).schemaVersion === 2) {
     return normalizeV2(
-      snap as PageSnapshotV2,
+      snap as PageSnapshotV2Legacy,
       pageId,
       contentHash,
       fallbackPaletteLen,
@@ -368,7 +346,6 @@ export async function loadPageSnapshot(
     const v1 = snap as PageSnapshotV1
     if (v1.pageId !== pageId) return null
     if (v1.contentHash !== contentHash) return null
-
     return normalizeV1(
       v1,
       pageId,
@@ -381,10 +358,6 @@ export async function loadPageSnapshot(
   return null
 }
 
-/**
- * Save snapshot v2.
- * Persist only v2; v1 is legacy and should not be re-emitted.
- */
 export async function savePageSnapshot(snap: PageSnapshotV2): Promise<void> {
   const paletteIdx = isFiniteNonNegativeInt(snap.paletteIdx)
     ? snap.paletteIdx
@@ -396,12 +369,12 @@ export async function savePageSnapshot(snap: PageSnapshotV2): Promise<void> {
     paletteLen: snap.paletteLen,
   })
 
-  const undoStackB64 = sanitizeUndoStackB64(snap.undoStackB64)
-
   const undoUsed = isFiniteNonNegativeInt(snap.undoBudgetUsed)
     ? clampInt(snap.undoBudgetUsed, 0, MAX_UNDO_STACK)
     : 0
+  const undoStackB64 = sanitizeUndoStackB64(snap.undoStackB64)
 
+  // Filter undo stack by exact bytes length equality with current progress.
   const progressLen = base64ToBytes(p.progressB64)?.length ?? 0
   const safeUndoStack =
     progressLen > 0
@@ -420,6 +393,7 @@ export async function savePageSnapshot(snap: PageSnapshotV2): Promise<void> {
       : 0,
     paletteIdx,
 
+    // Intentionally do not persist fills to avoid bloat.
     progressB64: p.progressB64,
     regionsCount: p.regionsCount,
     paletteLen: p.paletteLen,
@@ -442,8 +416,6 @@ export async function deletePageSnapshot(
 ): Promise<void> {
   await delKey(makePageKey(pageId, contentHash))
 }
-
-/* ---------------------- convenience exports for UI ------------------------ */
 
 export const SNAPSHOT_UNPAINTED = UNPAINTED
 export const SNAPSHOT_MAX_UNDO = MAX_UNDO_STACK

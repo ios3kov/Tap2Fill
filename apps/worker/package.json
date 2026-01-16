@@ -1,25 +1,26 @@
 {
-  "name": "@tap2fill/worker",
-  "private": true,
-  "version": "0.0.0",
-  "type": "module",
-  "scripts": {
-    "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
-    "lint": "biome lint .",
-    "format": "biome format --write ."
-  },
-  "dependencies": {
-    "@tap2fill/shared": "workspace:*",
-    "grammy": "^1.30.0",
-    "hono": "^4.6.12",
-    "zod": "^3.24.1"
-  },
-  "devDependencies": {
-    "@biomejs/biome": "^1.9.4",
-    "@cloudflare/workers-types": "^4.20250129.0",
-    "typescript": "^5.7.3",
-    "wrangler": "^4.59.2"
-  }
+	"name": "@tap2fill/worker",
+	"private": true,
+	"version": "0.0.0",
+	"type": "module",
+	"scripts": {
+		"dev": "wrangler dev",
+		"deploy": "wrangler deploy",
+		"typecheck": "tsc -p tsconfig.json --noEmit",
+		"lint": "biome lint .",
+		"format": "biome format --write .",
+		"test": "pnpm run typecheck"
+	},
+	"dependencies": {
+		"@tap2fill/shared": "workspace:*",
+		"grammy": "^1.30.0",
+		"hono": "^4.6.12",
+		"zod": "^3.24.1"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^1.9.4",
+		"@cloudflare/workers-types": "^4.20250129.0",
+		"typescript": "^5.7.3",
+		"wrangler": "^4.59.2"
+	}
 }

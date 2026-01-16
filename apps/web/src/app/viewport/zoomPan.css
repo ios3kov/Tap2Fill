@@ -56,7 +56,7 @@
   inset: 0;
 
   /* Let the container receive events; content is transformed, not interacted with directly */
-  pointer-events: none;
+  pointer-events: auto;
 
   /* Performance hint: translate+scale on every frame */
   will-change: transform;
