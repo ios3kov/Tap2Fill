@@ -30,7 +30,7 @@ const DEMO_CONTENT_HASH = "demo_hash_v1";
  * Stage 2 (Happy Path) – One page tap-to-fill
  * Goals:
  *  - TMA bootstrap + safe-area sizing
- *  - SVG contract: viewBox + data-region + outline pointer-events off
+ *  - SVG contract: viewBox + data-region + outline pointer-events off (via css + mount)
  *  - Hardened hit test: elementFromPoint -> climb to [data-region]
  *  - Local-first: apply fill instantly; advance clientRev; snapshot; enqueue me/state; batched sync
  */
@@ -60,7 +60,7 @@ export default function App() {
   // Visibility: server
   const [serverState, setServerState] = useState<MeState | null>(null);
 
-  // Stage 2: coloring UI state (kept local for now)
+  // Stage 2: coloring UI state (local-only)
   const [paletteIdx, setPaletteIdx] = useState(0);
   const [fills, setFills] = useState<FillMap>({});
   const [lastTap, setLastTap] = useState<string>("none");
@@ -71,7 +71,7 @@ export default function App() {
   const flushTimerRef = useRef<number | null>(null);
   const flushingRef = useRef(false);
 
-  // Keep stable references for async flows
+  // Stable refs for async flows
   const clientRevRef = useRef(0);
   const demoCounterRef = useRef(0);
 
@@ -86,7 +86,7 @@ export default function App() {
   useEffect(() => {
     const cleanup = tmaBootstrap();
 
-    // Small tick window: for initData length label without rerenders forever
+    // Small tick window: for initData length label without re-rendering forever
     const id = window.setInterval(() => setTick((t) => t + 1), 250);
     window.setTimeout(() => window.clearInterval(id), 3000);
 
@@ -109,11 +109,13 @@ export default function App() {
 
       if (cancelled) return;
       setLastPageId(lp);
+
       if (snap) {
         setClientRev(snap.clientRev);
         setDemoCounter(snap.demoCounter);
       }
     })();
+
     return () => {
       cancelled = true;
     };
@@ -142,7 +144,7 @@ export default function App() {
           setClientRev(st.clientRev);
           setLastPageId(st.lastPageId);
 
-          // In Stage 2 we keep fills local-only; rev is synced via snapshot.
+          // Stage 2 keeps fills local-only; we persist rev for deterministic restore.
           const snap: PageSnapshotV1 = {
             schemaVersion: 1,
             pageId: DEMO_PAGE_ID,
@@ -208,7 +210,7 @@ export default function App() {
     void flushOutboxOnce();
   }, [canCallServer]);
 
-  // ===== Stage 2: SVG mount + contract enforcement + apply fills =====
+  // ===== Stage 2: SVG mount (contract + sanitize + root attrs) + apply fills =====
   useEffect(() => {
     const host = svgHostRef.current;
     if (!host) return;
@@ -226,7 +228,7 @@ export default function App() {
       return;
     }
 
-    // Apply current fills (local-only in Stage 2)
+    // Apply current fills (Stage 2: local-only)
     applyFillsToContainer(host, fills);
   }, [fills]);
 
@@ -242,7 +244,6 @@ export default function App() {
     const nextRev = clientRevRef.current + 1;
     const nextCounter = demoCounterRef.current + 1;
 
-    // Update state immediately
     setClientRev(nextRev);
     setDemoCounter(nextCounter);
 
@@ -428,11 +429,21 @@ export default function App() {
           Simulate Local Action (snapshot + enqueue sync)
         </button>
 
-        <button className="t2f-btn" onClick={testIdempotencySameClientRev} disabled={!canDebugServer} style={{ marginTop: 10, opacity: !canDebugServer ? 0.5 : 0.9 }}>
+        <button
+          className="t2f-btn"
+          onClick={testIdempotencySameClientRev}
+          disabled={!canDebugServer}
+          style={{ marginTop: 10, opacity: !canDebugServer ? 0.5 : 0.9 }}
+        >
           Test Idempotency (same clientRev)
         </button>
 
-        <button className="t2f-btn" onClick={runSmokePutState} disabled={!canDebugServer} style={{ marginTop: 10, opacity: !canDebugServer ? 0.5 : 1 }}>
+        <button
+          className="t2f-btn"
+          onClick={runSmokePutState}
+          disabled={!canDebugServer}
+          style={{ marginTop: 10, opacity: !canDebugServer ? 0.5 : 1 }}
+        >
           Run Smoke Test (PUT /v1/me/state)
         </button>
 
@@ -446,7 +457,8 @@ export default function App() {
       </div>
 
       <div className="t2f-footnote" style={{ marginTop: 10 }}>
-        Stage 2: fills are local-only; we sync only (lastPageId, clientRev) for cross-device restore of the user’s last page. Next step: persist fills via page snapshot payload and/or /v1/progress.
+        Stage 2: fills are local-only; we sync only (lastPageId, clientRev) for cross-device restore of the user’s last
+        page. Next step: persist fills via page snapshot payload and/or /v1/progress.
       </div>
     </div>
   );
