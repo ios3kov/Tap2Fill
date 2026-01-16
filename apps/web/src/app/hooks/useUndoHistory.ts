@@ -14,12 +14,15 @@ export type UndoHistory = {
 
   /**
    * Pops one snapshot if budget allows.
-   * IMPORTANT: This is now ATOMIC for the history state:
-   * it updates hook state + refs inside the function.
+   * ATOMIC for history state: updates hook state + refs inside the function.
    *
-   * Caller does NOT need to call setFromRestore(...) afterwards.
+   * Caller MUST NOT call setFromRestore(...) after this.
    */
-  popSnapshotBudgeted: () => { packedB64: string; nextStack: string[]; nextUsed: number } | null
+  popSnapshotBudgeted: () => {
+    packedB64: string
+    nextStack: string[]
+    nextUsed: number
+  } | null
 
   resetKeepBudget: () => void
   resetAll: () => void
@@ -44,7 +47,9 @@ export function useUndoHistory(params: { budgetPerSession: number }): UndoHistor
 
   const setFromRestore = useCallback(
     (stack: string[], used: number) => {
-      const safeStack = (stack ?? []).slice(0, APP_CONFIG.limits.undoStackMax).map((s) => String(s ?? "").trim())
+      const safeStack = (stack ?? [])
+        .slice(0, APP_CONFIG.limits.undoStackMax)
+        .map((s) => String(s ?? "")) // IMPORTANT: keep empty string as valid snapshot
       const safeUsed = clampNonNegativeInt(used, 0)
 
       setUndoStackB64(safeStack)
@@ -57,11 +62,11 @@ export function useUndoHistory(params: { budgetPerSession: number }): UndoHistor
   const pushSnapshot = useCallback(
     (prevPackedProgressB64: string) => {
       const prev = undoStackRef.current
-      const item = String(prevPackedProgressB64 ?? "").trim()
+      const item = String(prevPackedProgressB64 ?? "") // keep empty snapshot valid
 
-      // Keep empty snapshots out: they are valid "reset" states only if you explicitly want them.
-      // In Stage 3, empty progress is almost always a bug (means "we didn't pack").
-      if (!item) return
+      // Avoid pushing duplicates (common when progress isn't changing).
+      const last = prev.length > 0 ? String(prev[prev.length - 1] ?? "") : null
+      if (last !== null && last === item) return
 
       const next = [...prev, item].slice(-APP_CONFIG.limits.undoStackMax)
       setUndoStackB64(next)
@@ -75,7 +80,10 @@ export function useUndoHistory(params: { budgetPerSession: number }): UndoHistor
     return Math.max(0, params.budgetPerSession - used)
   }, [params.budgetPerSession, undoBudgetUsed])
 
-  const canUndo = useMemo(() => undoLeft > 0 && undoStackB64.length > 0, [undoLeft, undoStackB64.length])
+  const canUndo = useMemo(
+    () => undoLeft > 0 && undoStackB64.length > 0,
+    [undoLeft, undoStackB64.length],
+  )
 
   const popSnapshotBudgeted = useCallback(() => {
     const stack = undoStackRef.current
@@ -85,7 +93,7 @@ export function useUndoHistory(params: { budgetPerSession: number }): UndoHistor
     const left = Math.max(0, params.budgetPerSession - used)
     if (left <= 0) return null
 
-    const packedB64 = String(stack[stack.length - 1] ?? "").trim()
+    const packedB64 = String(stack[stack.length - 1] ?? "") // may be empty: valid "blank page"
     const nextStack = stack.slice(0, -1)
     const nextUsed = used + 1
 

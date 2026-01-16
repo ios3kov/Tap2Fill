@@ -7,21 +7,18 @@ import { applyFillToRegion, hitTestRegionAtPoint } from "../svgTapToFill"
 import { clampInt } from "../domain/guards"
 
 /**
- * Minimal, deterministic, storage-safe encoder for progressB64.
- * We intentionally keep it simple and forward-compatible:
- * - JSON object: { [regionId]: color }
- * - base64url (no '+' '/' '='), safe for URLs/storage.
+ * Stage-3 progress encoding: JSON FillMap -> standard base64 (NOT base64url).
  *
- * IMPORTANT: This must match your decoder expectations. In this project, undo/restore
- * currently relies on decodeProgressB64ToFillMap(...) which, in Stage 3, can safely
- * interpret this JSON-based payload.
+ * Rationale:
+ * - Many decoders (atob/Buffer) assume standard base64 with '+' '/' and '=' padding.
+ * - base64url requires decoder cooperation; if mismatched, you typically get empty/failed decode,
+ *   which looks like "reset" on undo/restore.
+ *
+ * Payload is ASCII-safe (region ids + hex colors), so btoa is safe here.
  */
 function encodeProgressB64FromFillMap(fills: FillMap): string {
   const json = JSON.stringify(fills ?? {})
-  // btoa expects latin1. Our payload is ASCII (region ids + hex colors), so it's safe.
-  const b64 = window.btoa(json)
-  // base64url
-  return b64.replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "")
+  return window.btoa(json)
 }
 
 export function useTapToFillHandlers(params: {
@@ -91,7 +88,7 @@ export function useTapToFillHandlers(params: {
 
   useEffect(() => {
     if (!enabled) return
-    // if gesture ended, clear stuck touch ids
+    // If gesture ended, clear stuck touch ids.
     if (!isGesturingRef.current) activeTouchIdsRef.current.clear()
   }, [enabled, isGesturingRef])
 
@@ -156,12 +153,11 @@ export function useTapToFillHandlers(params: {
         const prevColor = prevFills[hit.regionId]
 
         // No-op tap (already same color) -> do nothing (no undo, no commit, no rev bump).
-        if (prevColor === color) {
-          return
-        }
+        if (prevColor === color) return
 
         // Snapshot BEFORE mutation (for undo).
-        pushUndoSnapshot(String(progressB64Ref.current ?? "").trim())
+        // IMPORTANT: empty string is a valid "blank page" snapshot.
+        pushUndoSnapshot(String(progressB64Ref.current ?? ""))
 
         // Apply to DOM immediately for perceived responsiveness.
         applyFillToRegion(host, hit.regionId, color)
