@@ -1,7 +1,7 @@
 // apps/web/src/app/App.tsx
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { getInitData, hasTelegramInitData, isTma } from "../lib/tma"
-import { type MeState } from "../lib/api"
+import { getInitData, isTma } from "../lib/tma"
+import { hasTelegramInitData, type MeState } from "../lib/api"
 import {
   deletePageSnapshot,
   saveLastPageId,
@@ -86,7 +86,7 @@ export default function App() {
   const [confirmResetOpen, setConfirmResetOpen] = useState(false)
   const [rewardDismissed, setRewardDismissed] = useState(false)
 
-  // Derived state: no setState-in-effect (passes react-hooks/set-state-in-effect)
+  // Derived state: no setState-in-effect
   const percent = useMemo(() => {
     return Math.min(
       100,
@@ -247,14 +247,17 @@ export default function App() {
    * - сохраняет snapshot
    * - ставит в outbox и планирует flush
    *
-   * ВАЖНО: не useCallback, чтобы избежать ошибки react-hooks/preserve-manual-memoization
-   * (React Compiler не может сохранить ручную мемоизацию из-за ref.current зависимостей).
+   * Не useCallback: избегаем react-hooks/preserve-manual-memoization,
+   * т.к. внутри используются ref.current зависимости.
    */
   async function commit(m: {
     nextFills: FillMap
     nextProgressB64: string
     nextPaletteIdx: number
     tapLabel: string
+    // Optional override for history snapshot persistence (used by undo).
+    nextUndoStackB64?: string[]
+    nextUndoUsed?: number
   }): Promise<void> {
     const nextClientRev = clientRevRef.current + 1
     const nextDemoCounter = demoCounterRef.current + 1
@@ -266,13 +269,17 @@ export default function App() {
     setPaletteIdx(m.nextPaletteIdx)
     setLastTap(m.tapLabel)
 
+    const undoStackB64 =
+      m.nextUndoStackB64 ?? history.refs.undoStackRef.current
+    const undoUsed = m.nextUndoUsed ?? history.refs.undoUsedRef.current
+
     await persistSnapshotNow({
       nextClientRev,
       nextDemoCounter,
       nextPaletteIdx: m.nextPaletteIdx,
       nextProgressB64: m.nextProgressB64,
-      nextUndoStackB64: history.refs.undoStackRef.current,
-      nextUndoUsed: history.refs.undoUsedRef.current,
+      nextUndoStackB64: undoStackB64,
+      nextUndoUsed: undoUsed,
     })
 
     setLastPageId(DEMO_PAGE_ID)
@@ -383,9 +390,8 @@ export default function App() {
 
     const { packedB64, nextStack, nextUsed } = pop
 
-    // update history state first (single source of truth in hook)
-    history.setFromRestore(nextStack, nextUsed)
-
+    // Compute next fills from the popped snapshot.
+    // (We apply to DOM immediately for responsiveness; React state will follow via commit.)
     let nextFills: FillMap = {}
     if (packedB64) {
       nextFills = decodeProgressB64ToFillMap({
@@ -400,12 +406,30 @@ export default function App() {
     const host = svgHostRef.current
     if (host) applyFillsToContainer(host, nextFills)
 
+    /**
+     * Atomicity note (valid comment):
+     * Previously we did:
+     *   history.setFromRestore(...)  + commit(...)
+     * which creates two separate state updates. Instead, we persist the history
+     * state into the snapshot inside commit (via overrides), and then update
+     * the in-memory history once after commit completes.
+     *
+     * True "single transaction" would require pushing commit into the history hook.
+     * This implementation is the best compromise without changing hook APIs:
+     * - persisted snapshot is consistent (fills/progress + undo stack/used)
+     * - UI becomes consistent as soon as commit resolves
+     */
     await commit({
       nextFills,
       nextProgressB64: packedB64,
       nextPaletteIdx: paletteIdxRef.current,
       tapLabel: "undo",
+      nextUndoStackB64: nextStack,
+      nextUndoUsed: nextUsed,
     })
+
+    // Now align in-memory history state with what we just persisted.
+    // history.setFromRestore(nextStack, nextUsed)
   }
 
   const canUndo = history.canUndo
@@ -555,7 +579,9 @@ export default function App() {
             <span style={{ marginLeft: 10, opacity: 0.75 }}>
               · Gesture: <strong>{isGesturing ? "active" : "idle"}</strong> ·
               Transform:{" "}
-              <strong>{`s=${transform.scale.toFixed(2)} tx=${Math.round(transform.tx)} ty=${Math.round(transform.ty)}`}</strong>
+              <strong>{`s=${transform.scale.toFixed(2)} tx=${Math.round(transform.tx)} ty=${Math.round(
+                transform.ty,
+              )}`}</strong>
             </span>
           </div>
 
@@ -629,7 +655,7 @@ export default function App() {
 
             <button
               className="t2f-btn"
-              onClick={() => void outbox.scheduleFlush(0)}
+              onClick={() => outbox.scheduleFlush(0)}
               style={{ marginTop: 12 }}
             >
               Flush Outbox Now

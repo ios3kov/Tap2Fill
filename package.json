@@ -3,13 +3,22 @@
   "private": true,
   "packageManager": "pnpm@9.15.4",
   "scripts": {
-    "dev:web": "pnpm -C apps/web dev",
-    "build:web": "pnpm -C apps/web build",
-    "dev:worker": "pnpm -C apps/worker dev",
-    "deploy:worker": "pnpm -C apps/worker deploy",
-    "typecheck": "pnpm -r typecheck",
-    "lint": "pnpm -r lint",
-    "format": "pnpm -r format"
+    "dev:web": "pnpm --filter web run dev",
+    "build:web": "pnpm --filter web run build",
+    "lint:web": "pnpm --filter web run lint",
+    "format:web": "pnpm --filter web run format",
+    "typecheck:web": "pnpm --filter web run typecheck",
+
+    "dev:worker": "pnpm --filter @tap2fill/worker run dev",
+    "deploy:worker": "pnpm --filter @tap2fill/worker run deploy",
+    "lint:worker": "pnpm --filter @tap2fill/worker run lint",
+    "format:worker": "pnpm --filter @tap2fill/worker run format",
+    "typecheck:worker": "pnpm --filter @tap2fill/worker run typecheck",
+    "test:worker": "pnpm --filter @tap2fill/worker run test",
+
+    "typecheck": "pnpm -r run typecheck",
+    "lint": "pnpm -r run lint",
+    "format": "pnpm -r run format"
   },
   "devDependencies": {
     "wrangler": "^4"
