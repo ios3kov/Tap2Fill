@@ -1,16 +1,22 @@
 /* apps/web/src/app/svgTapToFill.css
  *
- * Stage 2 — SVG Tap-to-Fill pointer policy + minimal UI primitives.
+ * Stage 3 — SVG Tap-to-Fill pointer policy + minimal UI primitives.
  *
  * Contract:
- * - Root SVG marked by svgTapToFill.ts with: data-page-root="1" (configurable, but default is data-page-root)
+ * - Root SVG must be marked by svgTapToFill.ts with: data-page-root="1"
  * - Clickable regions: [data-region="R###"]
  * - Non-interactive decoration/outline: [data-role="outline"]
  *
- * Hit-test hardening policy:
- * - Root SVG: pointer-events: none
+ * Pointer-events policy (robust across browsers):
+ * - Root SVG: pointer-events: auto (do NOT disable at root; can break subtree hit-testing)
+ * - All SVG children: pointer-events: none (default)
  * - Regions: pointer-events: all
  * - Outline: pointer-events: none
+ *
+ * Rationale:
+ * - Keeps document.elementFromPoint() returning actual SVG nodes under the finger.
+ * - Prevents accidental interactions with non-region elements.
+ * - Avoids Safari/Chrome quirks where pointer-events:none on <svg> blocks descendants.
  */
 
 /* ===== Pointer-events hardening (core) ===== */
@@ -20,28 +26,54 @@
   width: 100%;
   height: auto;
 
-  /* DO NOT disable pointer-events on the root SVG.
-     It breaks elementFromPoint()/hit-testing for descendants. */
+  /* IMPORTANT: keep root hittable so descendants can be discovered by elementFromPoint */
   pointer-events: auto;
 
   user-select: none;
   -webkit-user-select: none;
+
+  /* Prevent iOS context menu on long-press */
   -webkit-touch-callout: none;
 
+  /* Performance: isolate paint/layout; safe for embedded SVG usage */
   contain: layout paint;
 }
 
-[data-page-root] [data-region] {
-  /* SVG hit-testing should happen on regions */
-  pointer-events: all;
-  cursor: pointer;
-}
-
-[data-page-root] [data-role="outline"] {
-  /* Outlines/decoration must not intercept hits */
+/* Default: nothing inside SVG should capture pointer events unless explicitly allowed */
+[data-page-root] * {
   pointer-events: none;
 }
 
+[data-page-root] [data-region] {
+  /* Enable hit-testing only for paint regions */
+  pointer-events: all;
+
+  /* UX: desktop affordance (mobile ignores cursor) */
+  cursor: pointer;
+
+  /* iOS: remove gray tap highlight */
+  -webkit-tap-highlight-color: transparent;
+
+  /*
+   * Ghost Path hardening:
+   * Some browsers may treat paths without fill (or fill="none") as non-hittable.
+   * Setting transparent fill stabilizes hit-testing without visually altering the SVG.
+   *
+   * Note:
+   * - This does not override author-provided fill values that are set inline/JS later,
+   *   but ensures a baseline paint server exists for hit-test.
+   */
+  fill: transparent;
+
+  /* Optional: makes fill changes feel responsive without heavy layout cost */
+  transition: fill 0.15s ease-out;
+}
+
+[data-page-root] [data-role="outline"] {
+  pointer-events: none;
+}
+
+/* Defense-in-depth: outline nested inside a region must never capture events */
 [data-page-root] [data-region] [data-role="outline"] {
   pointer-events: none;
 }
@@ -55,7 +87,7 @@
   background: rgba(127, 127, 127, 0.06);
   padding: 10px;
 
-  /* Mobile: allow taps but avoid pinch/scroll conflicts; safe default for Stage 2 */
+  /* Mobile: disable native scroll/zoom conflicts; zoomPan engine handles gestures */
   touch-action: none;
 }
 
@@ -150,6 +182,6 @@
 /* Accessibility: reduce any future transitions/animations if added */
 @media (prefers-reduced-motion: reduce) {
   [data-page-root] [data-region] {
-    scroll-behavior: auto;
+    transition: none;
   }
 }
