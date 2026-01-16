@@ -1,11 +1,28 @@
-import { useCallback, useEffect, useRef } from "react"
+// apps/web/src/app/hooks/useTapToFillHandlers.ts
+import { useCallback, useEffect, useMemo, useRef } from "react"
 import type React from "react"
 import { APP_CONFIG } from "../config/appConfig"
 import type { FillMap } from "../coloring"
 import { clampInt } from "../domain/guards"
-import { encodeBytesToBase64, packFillMapToBytes } from "../progress/pack"
+import {
+  encodeBytesToBase64,
+  makeEmptyProgressBytes,
+  packFillMapToBytes,
+} from "../progress/pack"
 import { applyFillToRegion, hitTestRegionAtPoint } from "../svgTapToFill"
 
+/**
+ * Tap-to-fill handlers (Stage 3)
+ *
+ * Key invariants (for Undo/Restore correctness):
+ * - progressB64 is always the canonical "bytes-packed" base64 produced by packFillMapToBytes(...)
+ * - empty page is also represented as bytes-packed base64 (NOT "")
+ * - undo snapshots store the previous packed progressB64 (including "empty page" snapshot)
+ *
+ * Safety / resilience:
+ * - ignores unknown regions/colors during packing (content updates won't crash clients)
+ * - guards multi-touch and gesture mode to prevent accidental fills during zoom/pan
+ */
 export function useTapToFillHandlers(params: {
   enabled: boolean
   isGesturingRef: React.MutableRefObject<boolean>
@@ -49,6 +66,24 @@ export function useTapToFillHandlers(params: {
     pushUndoSnapshot,
     commit,
   } = params
+
+  /**
+   * Canonical empty snapshot for this page's region order length.
+   * This prevents "undo looks like reset" due to empty/invalid base64.
+   */
+  const emptyProgressB64 = useMemo(() => {
+    const bytes = makeEmptyProgressBytes(regionOrder.length)
+    return encodeBytesToBase64(bytes)
+  }, [regionOrder.length])
+
+  /**
+   * Stable getter to satisfy exhaustive-deps and ensure we always snapshot
+   * a valid packed progress (never empty string).
+   */
+  const getPrevPackedProgress = useCallback((): string => {
+    const s = String(progressB64Ref.current ?? "").trim()
+    return s.length > 0 ? s : emptyProgressB64
+  }, [progressB64Ref, emptyProgressB64])
 
   const onPointerDownCapture = useCallback(
     (e: React.PointerEvent) => {
@@ -125,7 +160,7 @@ export function useTapToFillHandlers(params: {
           // No region hit; no history mutation.
           await commit({
             nextFills: fillsRef.current,
-            nextProgressB64: progressB64Ref.current,
+            nextProgressB64: getPrevPackedProgress(),
             nextPaletteIdx: paletteIdxRef.current,
             tapLabel: "tap: no region",
           })
@@ -140,7 +175,7 @@ export function useTapToFillHandlers(params: {
         if (prevColor === color) return
 
         // Snapshot BEFORE mutation (undo must restore previous packed progress).
-        pushUndoSnapshot(String(progressB64Ref.current ?? ""))
+        pushUndoSnapshot(getPrevPackedProgress())
 
         // Apply to DOM immediately for perceived responsiveness.
         applyFillToRegion(host, hit.regionId, color)
@@ -170,13 +205,13 @@ export function useTapToFillHandlers(params: {
       isGesturingRef,
       svgHostRef,
       fillsRef,
-      progressB64Ref,
       paletteIdxRef,
       regionOrder,
       palette,
       activeColor,
       pushUndoSnapshot,
       commit,
+      getPrevPackedProgress,
     ],
   )
 
