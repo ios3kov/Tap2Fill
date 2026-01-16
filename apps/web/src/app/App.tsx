@@ -27,7 +27,12 @@ import "./viewport/zoomPan.css"
 import { APP_CONFIG } from "./config/appConfig"
 import { normalizePageId } from "./domain/guards"
 import { buildSnapshot } from "./domain/snapshotBuilder"
-import { decodeProgressB64ToFillMap } from "./progress/pack"
+import {
+  compilePackContext,
+  decodeProgressB64ToFillMap,
+  encodeBytesToBase64,
+  makeEmptyProgressBytes,
+} from "./progress/pack"
 
 import { useBootstrap } from "./hooks/useBootstrap"
 import { useOutboxSync } from "./hooks/useOutboxSync"
@@ -44,7 +49,7 @@ const DEMO_PAGE_ID = "page_demo_1"
 const DEMO_CONTENT_HASH = "demo_hash_v1"
 
 // Demo page metadata (Stage 3: static; later comes from catalog/API)
-const DEMO_REGIONS_COUNT = 240 // must match actual page
+const DEMO_REGIONS_COUNT = 4 // must match actual page
 const DEMO_PALETTE: readonly string[] = DEFAULT_PALETTE
 
 const DEMO_REGION_ORDER: readonly string[] = Array.from(
@@ -61,9 +66,22 @@ type CommitInput = {
   nextProgressB64: string
   nextPaletteIdx: number
   tapLabel: string
-  // Optional override for history snapshot persistence (used by undo).
+  // Optional override for history snapshot persistence (used by undo/reset).
   nextUndoStackB64?: string[]
   nextUndoUsed?: number
+}
+
+// Canonical packed empty progress for this demo page.
+function makeDemoEmptyProgressB64(): string {
+  const ctx = compilePackContext(DEMO_REGION_ORDER, DEMO_PALETTE, {
+    strictInputs: true,
+    allowDuplicateRegionIds: false,
+    allowDuplicatePaletteColors: false,
+    ignoreUnknownRegions: true,
+    ignoreUnknownColors: true,
+  })
+  const bytes = makeEmptyProgressBytes(ctx.regionsCount, ctx.opts)
+  return encodeBytesToBase64(bytes)
 }
 
 export default function App() {
@@ -87,7 +105,10 @@ export default function App() {
   const [lastTap, setLastTap] = useState<string>("none")
 
   // Packed progress (forward compatible storage)
-  const [progressB64, setProgressB64] = useState<string>("")
+  // IMPORTANT: keep canonical packed base64; avoid "" except regionsCount=0.
+  const [progressB64, setProgressB64] = useState<string>(() =>
+    makeDemoEmptyProgressB64(),
+  )
 
   // Zoom/Pan state
   const [transform, setTransform] = useState({ scale: 1, tx: 0, ty: 0 })
@@ -99,6 +120,9 @@ export default function App() {
 
   // Prevent overlapping commit() calls (race conditions on slow persistence/outbox).
   const isCommittingRef = useRef(false)
+
+  // Canonical empty progress cached once (stable for this page contentHash).
+  const emptyProgressB64 = useMemo(() => makeDemoEmptyProgressB64(), [])
 
   // Derived state: no setState-in-effect
   const percent = useMemo(() => {
@@ -130,7 +154,7 @@ export default function App() {
   const demoCounterRef = useRef(0)
   const paletteIdxRef = useRef(0)
   const fillsRef = useRef<FillMap>({})
-  const progressB64Ref = useRef<string>("")
+  const progressB64Ref = useRef<string>(emptyProgressB64)
   const isGesturingRef = useRef(false)
 
   useEffect(() => {
@@ -205,7 +229,8 @@ export default function App() {
     setClientRev,
     setDemoCounter,
     setPaletteIdx,
-    setProgressB64,
+    // If storage returns empty (shouldn't), normalize to canonical empty.
+    setProgressB64: (v) => setProgressB64(v && v.trim() ? v : emptyProgressB64),
     setFills,
     onRestoreUndo: history.setFromRestore,
   })
@@ -267,8 +292,6 @@ export default function App() {
    *
    * Concurrency:
    * - guarded by isCommittingRef to prevent overlapping commits if persistence is slow.
-   *
-   * Note: this is intentionally not useCallback; it uses multiple refs and stays readable.
    */
   async function commit(m: CommitInput): Promise<void> {
     if (isCommittingRef.current) return
@@ -278,10 +301,16 @@ export default function App() {
       const nextClientRev = clientRevRef.current + 1
       const nextDemoCounter = demoCounterRef.current + 1
 
+      // Never allow empty string for progress in stage-3 protocol.
+      const nextProgressB64 =
+        m.nextProgressB64 && m.nextProgressB64.trim()
+          ? m.nextProgressB64
+          : emptyProgressB64
+
       setClientRev(nextClientRev)
       setDemoCounter(nextDemoCounter)
       setFills(m.nextFills)
-      setProgressB64(m.nextProgressB64)
+      setProgressB64(nextProgressB64)
       setPaletteIdx(m.nextPaletteIdx)
       setLastTap(m.tapLabel)
 
@@ -290,7 +319,7 @@ export default function App() {
       demoCounterRef.current = nextDemoCounter
       paletteIdxRef.current = m.nextPaletteIdx
       fillsRef.current = m.nextFills
-      progressB64Ref.current = m.nextProgressB64
+      progressB64Ref.current = nextProgressB64
 
       const undoStackB64 =
         m.nextUndoStackB64 ?? history.refs.undoStackRef.current
@@ -300,7 +329,7 @@ export default function App() {
         nextClientRev,
         nextDemoCounter,
         nextPaletteIdx: m.nextPaletteIdx,
-        nextProgressB64: m.nextProgressB64,
+        nextProgressB64,
         nextUndoStackB64: undoStackB64,
         nextUndoUsed: undoUsed,
       })
@@ -330,11 +359,10 @@ export default function App() {
     palette: DEMO_PALETTE,
     activeColor,
     pushUndoSnapshot: history.pushSnapshot,
-    commit, // strongly typed via CommitInput
+    commit,
   })
 
   // Gallery progress placeholder (Stage 3)
-  // Intentionally empty for now; will be filled from snapshot storage when gallery becomes dynamic.
   const progressByPageId = useMemo<
     Record<string, { pageId: string; ratio: number; completed: boolean }>
   >(() => ({}), [])
@@ -364,7 +392,7 @@ export default function App() {
     setLastPageId(null)
     setServerState(null)
     setFills({})
-    setProgressB64("")
+    setProgressB64(emptyProgressB64)
     setPaletteIdx(0)
     history.resetAll()
     setLastTap("none")
@@ -375,7 +403,7 @@ export default function App() {
     demoCounterRef.current = 0
     paletteIdxRef.current = 0
     fillsRef.current = {}
-    progressB64Ref.current = ""
+    progressB64Ref.current = emptyProgressB64
 
     const t = { scale: 1, tx: 0, ty: 0 }
     setTransform(t)
@@ -388,7 +416,7 @@ export default function App() {
       nextClientRev: 0,
       nextDemoCounter: 0,
       nextPaletteIdx: 0,
-      nextProgressB64: "",
+      nextProgressB64: emptyProgressB64,
       nextUndoStackB64: [],
       nextUndoUsed: 0,
     })
@@ -401,7 +429,7 @@ export default function App() {
     history.resetKeepBudget()
 
     const nextFills: FillMap = {}
-    const nextProgress = ""
+    const nextProgressB64 = emptyProgressB64
 
     const t = { scale: 1, tx: 0, ty: 0 }
     setTransform(t)
@@ -413,9 +441,12 @@ export default function App() {
 
     await commit({
       nextFills,
-      nextProgressB64: nextProgress,
+      nextProgressB64,
       nextPaletteIdx: 0,
       tapLabel: "reset: start over",
+      // Make reset atomic for undo: we already cleared history above.
+      nextUndoStackB64: [],
+      nextUndoUsed: history.refs.undoUsedRef.current,
     })
   }
 
@@ -425,23 +456,25 @@ export default function App() {
 
     const { packedB64, nextStack, nextUsed } = pop
 
-    let nextFills: FillMap = {}
-    if (packedB64) {
-      nextFills = decodeProgressB64ToFillMap({
-        progressB64: packedB64,
-        regionsCount: DEMO_REGIONS_COUNT,
-        paletteLen: DEMO_PALETTE.length,
-        regionOrder: DEMO_REGION_ORDER,
-        palette: DEMO_PALETTE,
-      })
-    }
+    // packedB64 can be empty string snapshot (allowed by undo history),
+    // but our progress protocol uses canonical packed empty.
+    const normalizedPacked =
+      packedB64 && packedB64.trim() ? packedB64 : emptyProgressB64
+
+    const nextFills = decodeProgressB64ToFillMap({
+      progressB64: normalizedPacked,
+      regionsCount: DEMO_REGIONS_COUNT,
+      paletteLen: DEMO_PALETTE.length,
+      regionOrder: DEMO_REGION_ORDER,
+      palette: DEMO_PALETTE,
+    })
 
     const host = svgHostRef.current
     if (host) applyFillsToContainer(host, nextFills)
 
     await commit({
       nextFills,
-      nextProgressB64: packedB64,
+      nextProgressB64: normalizedPacked,
       nextPaletteIdx: paletteIdxRef.current,
       tapLabel: "undo",
       nextUndoStackB64: nextStack,
