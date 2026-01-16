@@ -61,6 +61,11 @@ const DEMO_CONTENT_HASH = "demo_hash_v1"
 const DEMO_REGIONS_COUNT = 240 // must match actual page
 const DEMO_PALETTE: readonly string[] = DEFAULT_PALETTE
 
+const DEMO_REGION_ORDER: readonly string[] = Array.from(
+  { length: DEMO_REGIONS_COUNT },
+  (_, i) => `R${String(i + 1).padStart(3, "0")}`,
+)
+
 // Undo policy (Stage 3)
 const UNDO_BUDGET_PER_SESSION = 5
 
@@ -226,6 +231,29 @@ export default function App() {
   const undoUsedRef = useRef(0)
   const isGesturingRef = useRef(false)
 
+  const activeTouchPointersRef = useRef(0)
+
+  const onCanvasPointerDownCapture = (e: React.PointerEvent) => {
+    if (e.pointerType !== "touch") return
+    activeTouchPointersRef.current += 1
+  }
+
+  const onCanvasPointerUpCapture = (e: React.PointerEvent) => {
+    if (e.pointerType !== "touch") return
+    activeTouchPointersRef.current = Math.max(
+      0,
+      activeTouchPointersRef.current - 1,
+    )
+  }
+
+  const onCanvasPointerCancelCapture = (e: React.PointerEvent) => {
+    if (e.pointerType !== "touch") return
+    activeTouchPointersRef.current = Math.max(
+      0,
+      activeTouchPointersRef.current - 1,
+    )
+  }
+
   useEffect(() => {
     clientRevRef.current = clientRev
   }, [clientRev])
@@ -351,10 +379,7 @@ export default function App() {
             progressB64: packed,
             regionsCount: rc,
             paletteLen: pl,
-            regionOrder: Array.from(
-              { length: rc },
-              (_, i) => `R${String(i + 1).padStart(3, "0")}`,
-            ),
+            regionOrder: DEMO_REGION_ORDER,
             palette: DEMO_PALETTE,
           })
           setFills(decodedFills)
@@ -563,6 +588,14 @@ export default function App() {
 
   // ===== Tap-to-fill handler (blocked during gesture) =====
   async function onPointerDown(e: React.PointerEvent) {
+    // Block any fill during multi-touch (pinch/zoom) regardless of gesture detection timing.
+    if (e.pointerType === "touch") {
+      // Never fill with a secondary touch, and never fill while 2+ touches are active (pinch/zoom).
+      if (!e.isPrimary) return
+      if (activeTouchPointersRef.current >= 2) return
+      if (isGesturingRef.current) return
+    }
+
     if (isGesturingRef.current) return
     if (typeof e.button === "number" && e.button !== 0) return
 
@@ -724,10 +757,7 @@ export default function App() {
         progressB64: prevPacked,
         regionsCount: DEMO_REGIONS_COUNT,
         paletteLen: DEMO_PALETTE.length,
-        regionOrder: Array.from(
-          { length: DEMO_REGIONS_COUNT },
-          (_, i) => `R${String(i + 1).padStart(3, "0")}`,
-        ),
+        regionOrder: DEMO_REGION_ORDER,
         palette: DEMO_PALETTE,
       })
     } catch {
@@ -865,7 +895,7 @@ export default function App() {
           <div className="t2f-pageBar">
             <div className="t2f-pageBarLeft">
               <button className="t2f-actionBtn" onClick={goGallery}>
-                Back
+                Gallery
               </button>
             </div>
 
@@ -898,7 +928,6 @@ export default function App() {
               </button>
             </div>
           </div>
-
           {/* Palette */}
           <div className="t2f-card" style={{ marginTop: 12 }}>
             <div className="t2f-panel">
@@ -924,11 +953,13 @@ export default function App() {
               </div>
             </div>
           </div>
-
           {/* Zoom/Pan + Canvas */}
           <div
             ref={zoomContainerRef}
             className="t2f-canvas zp-container t2f-overlayHost"
+            onPointerDownCapture={onCanvasPointerDownCapture}
+            onPointerUpCapture={onCanvasPointerUpCapture}
+            onPointerCancelCapture={onCanvasPointerCancelCapture}
             onPointerDown={onPointerDown}
             style={{ marginTop: 12, height: 520 }}
             aria-label="Coloring canvas"
@@ -937,7 +968,6 @@ export default function App() {
               <div ref={svgHostRef} className="t2f-svgHost" />
             </div>
           </div>
-
           <div className="t2f-meta" style={{ marginTop: 10 }}>
             Last action: <strong>{lastTap}</strong> · Filled:{" "}
             <strong>{Object.keys(fills).length}</strong>
@@ -949,7 +979,6 @@ export default function App() {
               )}`}</strong>
             </span>
           </div>
-
           <ConfirmModal
             open={confirmResetOpen}
             title="Reset page?"
@@ -961,7 +990,6 @@ export default function App() {
             onConfirm={startOverPageConfirmed}
             onClose={() => setConfirmResetOpen(false)}
           />
-
           <CompletionReward
             open={rewardOpen}
             percent={percent}
@@ -975,7 +1003,6 @@ export default function App() {
               goGallery()
             }}
           />
-
           {/* Debug panel (kept) */}
           <div className="t2f-card" style={{ marginTop: 12 }}>
             <div className="t2f-panel">
