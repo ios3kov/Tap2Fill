@@ -20,28 +20,28 @@
   width: 100%;
   height: auto;
 
-  /* Hardening: prevent accidental selection/drags and ensure hit-testing only via regions */
-  pointer-events: none;
+  /* DO NOT disable pointer-events on the root SVG.
+     It breaks elementFromPoint()/hit-testing for descendants. */
+  pointer-events: auto;
+
   user-select: none;
   -webkit-user-select: none;
   -webkit-touch-callout: none;
 
-  /* Performance: isolate paint/layout; safe for embedded SVG usage */
   contain: layout paint;
 }
 
 [data-page-root] [data-region] {
+  /* SVG hit-testing should happen on regions */
   pointer-events: all;
-
-  /* UX: signal interactivity; safe for desktop. Mobile ignores cursor. */
   cursor: pointer;
 }
 
 [data-page-root] [data-role="outline"] {
+  /* Outlines/decoration must not intercept hits */
   pointer-events: none;
 }
 
-/* Optional: prevent outlines inside regions from capturing events if authoring mistakes occur */
 [data-page-root] [data-region] [data-role="outline"] {
   pointer-events: none;
 }
